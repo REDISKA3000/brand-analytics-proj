@@ -1,20 +1,30 @@
+# app.py
 import os
-import time
-import random
-import re
-from typing import List, Literal, Tuple, Optional, Dict, Any
-
-import streamlit as st
-import yaml
-from pydantic import BaseModel
-from openai import OpenAI
-import openai  # exceptions
-
 import io
+import re
+import time
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, Optional, List
 
 import pandas as pd
+import streamlit as st
+import yaml
+from openai import OpenAI
+
+import processing as proc  # processing.py рядом с app.py
+
+# ВАЖНО: эти два файла должны лежать рядом с app.py:
+# - llm_model.py  (класс OpenAIRelevanceBatchModel)
+# - filter_service.py (класс RelevanceFilterService)
+try:
+    from llm_model import OpenAIRelevanceBatchModel
+    from filter_service import RelevanceFilterService
+except Exception as e:
+    OpenAIRelevanceBatchModel = None
+    RelevanceFilterService = None
+    _IMPORT_ERR = e
+else:
+    _IMPORT_ERR = None
 
 try:
     from config_local import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
@@ -40,6 +50,7 @@ st.markdown(
   border-radius: 16px;
   padding: 16px 16px 10px 16px;
   box-shadow: 0 6px 20px rgba(0,0,0,0.04);
+  margin-bottom: 14px;
 }
 .badge-keep, .badge-drop, .badge-rule {
   display:inline-block;
@@ -59,7 +70,6 @@ st.markdown(
 
 DEFAULT_MODEL = "gpt-4.1-mini"
 
-# Это — базовый шаблон, а карточка бренда будет вставляться ниже автоматически.
 BASE_SYSTEM_TEMPLATE = """
 Ты — фильтр релевантности для бренда "{brand_name}" и его официальных цифровых каналов (если есть: приложение/сайт/бонусы).
 
@@ -81,43 +91,53 @@ BASE_SYSTEM_TEMPLATE = """
 """.strip()
 
 
-# ---------------- Structured Output ----------------
-class FilterItem(BaseModel):
-    global_idx: int
-    action: Literal["keep", "drop"]
-
-
-class BatchResult(BaseModel):
-    results: List[FilterItem]
-
-
-# ---------------- Brand Profiles ----------------
+# ---------------- Helpers: brands ----------------
 def load_brands(path: str = "brands.yaml") -> Dict[str, Dict[str, Any]]:
     if not os.path.exists(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    # нормализуем структуру
-    out = {}
+
+    out: Dict[str, Dict[str, Any]] = {}
     for k, v in data.items():
         if not isinstance(v, dict):
             continue
-        out[k] = v
-        out[k].setdefault("brand_name", k)
-        out[k].setdefault("description", "")
-        out[k].setdefault("aliases", [])
-        out[k].setdefault("sure_drop_patterns", [])
-        out[k].setdefault("pr_reply_markers", [])
+        p = dict(v)
+        p.setdefault("brand_name", k)
+        p.setdefault("description", "")
+        p.setdefault("aliases", [])
+        # старые ключи
+        p.setdefault("sure_drop_patterns", [])
+        p.setdefault("pr_reply_markers", [])
+        # новые ключи (для сервис-класса)
+        p.setdefault("brand_sure_drop", p.get("sure_drop_patterns", []))
+        p.setdefault("homonym_noise", [])
+        out[k] = p
     return out
 
 
+def normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    p = dict(profile or {})
+    p.setdefault("brand_name", "BRAND")
+    p.setdefault("description", "")
+    p.setdefault("aliases", [])
+    p.setdefault("sure_drop_patterns", [])
+    p.setdefault("pr_reply_markers", [])
+
+    # совместимость с RuleEngine в filter_service.py
+    if "brand_sure_drop" not in p or p["brand_sure_drop"] is None:
+        p["brand_sure_drop"] = p.get("sure_drop_patterns", [])
+    if "homonym_noise" not in p or p["homonym_noise"] is None:
+        p["homonym_noise"] = []
+    return p
+
+
 def format_system_prompt(base_template: str, profile: Dict[str, Any]) -> str:
-    brand_name = profile.get("brand_name", "BRAND")
+    brand_name = (profile.get("brand_name") or "BRAND").strip()
     desc = (profile.get("description") or "").strip()
     aliases = profile.get("aliases") or []
     aliases_str = ", ".join([a.strip()
                             for a in aliases if str(a).strip()]) or "—"
-
     return base_template.format(
         brand_name=brand_name,
         brand_description=desc if desc else "—",
@@ -125,15 +145,13 @@ def format_system_prompt(base_template: str, profile: Dict[str, Any]) -> str:
     ).strip()
 
 
-# ---------------- API ----------------
+# ---------------- Helpers: OpenAI ----------------
 def get_api_key() -> Optional[str]:
     secret_key = None
     try:
         secret_key = st.secrets.get("OPENAI_API_KEY", None)
     except Exception:
-        # если secrets.toml не существует — Streamlit кидает FileNotFoundError
         secret_key = None
-
     return secret_key or os.getenv("OPENAI_API_KEY") or LOCAL_OPENAI_API_KEY
 
 
@@ -143,21 +161,17 @@ def get_client() -> OpenAI:
     return OpenAI(api_key=api_key or "")
 
 
-# ---------------- LLM helpers ----------------
+# ---------------- Helpers: file IO ----------------
 def read_uploaded_table(uploaded_file) -> pd.DataFrame:
     name = (uploaded_file.name or "").lower()
-
     if name.endswith((".xlsx", ".xls")):
-        # Excel
         return pd.read_excel(uploaded_file, engine="openpyxl")
 
-    # CSV: пытаемся угадать разделитель
     data = uploaded_file.getvalue()
     bio = io.BytesIO(data)
     try:
         return pd.read_csv(bio, sep=None, engine="python", encoding="utf-8-sig")
     except Exception:
-        # fallback: часто бывает ;
         bio = io.BytesIO(data)
         try:
             return pd.read_csv(bio, sep=";", encoding="utf-8-sig")
@@ -167,392 +181,331 @@ def read_uploaded_table(uploaded_file) -> pd.DataFrame:
 
 
 def df_to_download_bytes(df: pd.DataFrame, out_fmt: str) -> tuple[bytes, str]:
-    """
-    out_fmt: "csv" | "xlsx"
-    returns: (bytes, mime)
-    """
     if out_fmt == "xlsx":
         buff = io.BytesIO()
         with pd.ExcelWriter(buff, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="result")
         return buff.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-    # csv
     return df.to_csv(index=False).encode("utf-8-sig"), "text/csv"
 
 
-def build_prompt(batch: List[Tuple[int, str]]) -> str:
-    lines = [
-        "Для каждой строки верни action=keep|drop.",
-        "Сохраняй global_idx как есть. Верни ровно столько results, сколько входных строк.",
-    ]
-    for gi, txt in batch:
-        lines.append(f"{gi}: {txt}")
-    lines.append(
-        "\nВерни JSON строго по схеме: {results: [{global_idx, action}, ...]}")
-    return "\n".join(lines)
+# ---------------- Preprocessing factory (uses processing.py) ----------------
+def _literal_to_pattern(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    esc = re.escape(s)
+    return rf"(?<!\w){esc}(?!\w)"
 
 
-def prepare_comment(text: str, truncate_chars: int = 800) -> str:
-    s = "" if text is None else str(text)
-    s = s.strip()
-    if truncate_chars and len(s) > truncate_chars:
-        s = s[:truncate_chars]
-    return s
+def build_brand_patterns(brand_name: str, aliases: List[str], extra_regex: str) -> List[str]:
+    pats: List[str] = []
+    for t in [brand_name] + (aliases or []):
+        p = _literal_to_pattern(t)
+        if p:
+            pats.append(p)
+
+    for line in (extra_regex or "").splitlines():
+        line = line.strip()
+        if line:
+            pats.append(line)
+
+    if not pats:
+        pats = [r"(brand|brands)"]
+    return pats
 
 
-def classify_batch(
-    batch: List[Tuple[int, str]],
-    client: OpenAI,
-    model: str,
-    system_prompt: str,
-    temperature: float = 0.0,
-    max_retries: int = 6,
-) -> Tuple[List[dict], float]:
-    prompt = build_prompt(batch)
+class PreprocessorFactory:
+    def __init__(self, max_words: int = 250):
+        self.max_words = max_words
 
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            t0 = time.perf_counter()
-            resp = client.responses.parse(
-                model=model,
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                text_format=BatchResult,
-                temperature=temperature,
-            )
-            dt = time.perf_counter() - t0
+    def make(self, profile: Dict[str, Any], extra_brand_patterns: str) -> proc.CommentPreprocessor:
+        brand_name = profile.get("brand_name") or "BRAND"
+        aliases = profile.get("aliases") or []
+        pats = build_brand_patterns(brand_name, aliases, extra_brand_patterns)
 
-            parsed: BatchResult = resp.output_parsed
-            out = []
-            for r in parsed.results:
-                out.append({"global_idx": r.global_idx,
-                           "action": r.action, "batch_latency_s": dt})
-            return out, dt
+        # меняем глобальную переменную processing.py "на лету"
+        proc.BRAND_PATTERNS = pats
 
-        except (
-            openai.RateLimitError,
-            openai.APITimeoutError,
-            openai.APIConnectionError,
-            openai.InternalServerError,
-            openai.BadRequestError,
-        ) as e:
-            last_err = e
-            sleep = min(8.0, 0.5 * (2**attempt)) + random.random() * 0.2
-            time.sleep(sleep)
+        return proc.CommentPreprocessor(
+            BRAND_PATTERNS=proc.BRAND_PATTERNS,
+            NOISE_PHRASES=proc.NOISE_PHRASES,
+            RU_STOP=proc.RU_STOP,
+            TOPIC_KEYWORDS=proc.TOPIC_KEYWORDS,
+            max_len=self.max_words,  # у класса max_len трактуется как число слов
+        )
 
-    raise RuntimeError(f"Max retries exceeded. Last error: {last_err!r}")
+    def preprocess_for_llm(self, text_rule: str, pre: proc.CommentPreprocessor) -> str:
+        out = pre.preprocess(text_rule, max_len=self.max_words)
+        return out if out else text_rule
 
 
-# ---------------- Pre-LLM "sure drop" rules ----------------
-_PHONE_RE = re.compile(r"(?i)(\+?\d[\d\-\s\(\)]{8,}\d)")
-# мягкий маркер “официального ответа”
-_DEFAULT_PR_MARKERS = [
-    r"(?i)^здравствуйте",
-    r"(?i)^добрый\s+день",
-    r"(?i)спасибо\s+за\s+(обращение|отзыв)",
-    r"(?i)нам\s+очень\s+приятно",
-    r"(?i)с\s+уважением",
-]
+# ---------------- App (class-based) ----------------
+class StreamlitRelevanceApp:
+    def __init__(self):
+        self.brands = load_brands("brands.yaml")
+        self.api_key_present = bool(get_api_key())
 
+    def sidebar_settings(self) -> Dict[str, Any]:
+        with st.sidebar:
+            st.subheader("Настройки")
+            model = st.text_input(
+                "Model", value=st.session_state.get("model", DEFAULT_MODEL))
+            temperature = st.slider("Temperature", 0.0, 1.0, float(
+                st.session_state.get("temperature", 0.0)), 0.1)
+            truncate_chars = st.number_input("Truncate chars", min_value=100, max_value=5000, value=int(
+                st.session_state.get("truncate_chars", 800)), step=50)
 
-def _match_any(patterns: List[str], text: str) -> Optional[str]:
-    for p in patterns:
-        try:
-            if re.search(p, text):
-                return p
-        except re.error:
-            # если кто-то положил плохую регэкспу — не падаем
-            continue
-    return None
+            st.session_state["model"] = model
+            st.session_state["temperature"] = temperature
+            st.session_state["truncate_chars"] = truncate_chars
 
+            brand_names = ["(manual)"] + sorted(list(self.brands.keys()))
+            chosen = st.selectbox("Компания", brand_names, index=int(
+                st.session_state.get("chosen_idx", 0)))
+            st.session_state["chosen_idx"] = brand_names.index(chosen)
 
-def chunk_list(lst, n: int):
-    return [lst[i: i + n] for i in range(0, len(lst), n)]
+            st.markdown(
+                '<div class="small-note">Под «manual» можно вставить карточку бренда руками.</div>', unsafe_allow_html=True)
 
+            st.subheader("Параллельная обработка (для файлов)")
+            batch_size = st.number_input("Batch size", 1, 50, int(
+                st.session_state.get("batch_size", 6)), 1)
+            max_workers = st.number_input("Max workers", 1, 20, int(
+                st.session_state.get("max_workers", 3)), 1)
+            st.session_state["batch_size"] = int(batch_size)
+            st.session_state["max_workers"] = int(max_workers)
 
-def run_filter_parallel_for_texts(
-    texts: List[str],
-    *,
-    client: OpenAI,
-    model: str,
-    system_prompt: str,
-    profile: Dict[str, Any],
-    temperature: float = 0.0,
-    batch_size: int = 6,
-    max_workers: int = 3,
-    truncate_chars: int = 800,
-) -> tuple[List[str], Dict[str, Any]]:
-    """
-    Возвращает:
-      - actions: список action для каждого текста ("keep"/"drop") в исходном порядке
-      - stats: метрики
-    """
-
-    t0_total = time.perf_counter()
-
-    # 0) prepare texts
-    clean = [prepare_comment(t, truncate_chars=truncate_chars) for t in texts]
-
-    # 1) rule-based drops first
-    actions = [None] * len(clean)
-    to_llm_pairs: List[Tuple[int, str]] = []
-
-    rule_drop_count = 0
-    for i, t in enumerate(clean):
-        hit = rule_based_sure_drop(t, profile)
-        if hit is not None:
-            actions[i] = "drop"
-            rule_drop_count += 1
-        else:
-            to_llm_pairs.append((i, t))
-
-    # если всё отрезалось правилами — LLM не нужен
-    if not to_llm_pairs:
-        total_s = time.perf_counter() - t0_total
-        return actions, {
-            "total_s": total_s,
-            "n": len(clean),
-            "rule_drops": rule_drop_count,
-            "llm_calls": 0,
-            "comments_per_s": (len(clean) / total_s) if total_s > 0 else None,
-            "mean_batch_latency_s": None,
+        return {
+            "model": model,
+            "temperature": float(temperature),
+            "truncate_chars": int(truncate_chars),
+            "chosen": chosen,
+            "batch_size": int(batch_size),
+            "max_workers": int(max_workers),
         }
 
-    # 2) chunk to LLM batches
-    batches = chunk_list(to_llm_pairs, batch_size)
+    def brand_profile_editor(self, chosen: str) -> tuple[Dict[str, Any], str]:
+        # берём профиль из файла или ручной
+        if chosen != "(manual)" and chosen in self.brands:
+            profile = dict(self.brands[chosen])
+        else:
+            profile = {
+                "brand_name": st.session_state.get("manual_brand_name", "BRAND"),
+                "description": st.session_state.get("manual_description", ""),
+                "aliases": st.session_state.get("manual_aliases", []),
+                "sure_drop_patterns": st.session_state.get("manual_sure_drop_patterns", []),
+                "pr_reply_markers": st.session_state.get("manual_pr_reply_markers", []),
+                "brand_sure_drop": st.session_state.get("manual_brand_sure_drop", []),
+                "homonym_noise": st.session_state.get("manual_homonym_noise", []),
+            }
 
-    # warmup (не обязателен, но можно оставить)
-    try:
-        _rows, _dt = classify_batch(
-            batch=batches[0],
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_retries=6,
+        profile = normalize_profile(profile)
+
+        st.subheader("Карточка бренда")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            brand_name = st.text_input(
+                "Brand name", value=profile.get("brand_name", "BRAND"))
+        with col2:
+            aliases_raw = st.text_input(
+                "Aliases (через запятую)",
+                value=", ".join(profile.get("aliases") or []),
+                placeholder="familia, фамилия, ...",
+            )
+
+        description = st.text_area(
+            "Описание бренда (контекст)",
+            value=profile.get("description", ""),
+            height=140,
+            placeholder="Кто это, что продаёт/делает, какие каналы (приложение/сайт), что считаем релевантным…",
         )
-    except Exception:
-        # если warmup упал — не блокируем пайплайн
-        pass
 
-    # 3) parallel LLM
-    llm_rows = []
-    batch_latencies = []
+        with st.expander("Бренд-паттерны для предобработки (regex)", expanded=False):
+            extra_brand_patterns = st.text_area(
+                "Каждая строка — отдельный regex. Добавится к brand_name и aliases.",
+                value=st.session_state.get("extra_brand_patterns", ""),
+                height=120,
+                key="extra_brand_patterns",
+                placeholder=r"например:\n(?<!\w)familia(?!\w)\n(?<!\w)фамилия(?!\w)\n",
+            )
 
-    def one_job(batch):
-        rows, dt = classify_batch(
-            batch=batch,
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_retries=6,
+        with st.expander("Правила «точно drop» (бренд-специфичные регэкспы)"):
+            sure_drop_text = st.text_area(
+                "По одному паттерну в строке",
+                value="\n".join(profile.get("sure_drop_patterns") or []),
+                height=140,
+                placeholder=r'(?i)\bsagrada\s+familia\b',
+            )
+
+        with st.expander("Маркеры PR/официальных ответов (регэкспы)"):
+            pr_text = st.text_area(
+                "По одному паттерну в строке",
+                value="\n".join(profile.get("pr_reply_markers") or []),
+                height=120,
+                placeholder=r"(?i)^здравствуйте",
+            )
+
+        # обновим профиль
+        profile["brand_name"] = brand_name.strip(
+        ) if brand_name.strip() else "BRAND"
+        profile["aliases"] = [a.strip()
+                              for a in aliases_raw.split(",") if a.strip()]
+        profile["description"] = description.strip()
+        profile["sure_drop_patterns"] = [line.strip()
+                                         for line in sure_drop_text.splitlines() if line.strip()]
+        profile["pr_reply_markers"] = [line.strip()
+                                       for line in pr_text.splitlines() if line.strip()]
+
+        # для сервис-класса: прокинем совместимые ключи
+        profile["brand_sure_drop"] = profile["sure_drop_patterns"]
+        profile.setdefault("homonym_noise", [])
+
+        if chosen == "(manual)":
+            st.session_state["manual_brand_name"] = profile["brand_name"]
+            st.session_state["manual_aliases"] = profile["aliases"]
+            st.session_state["manual_description"] = profile["description"]
+            st.session_state["manual_sure_drop_patterns"] = profile["sure_drop_patterns"]
+            st.session_state["manual_pr_reply_markers"] = profile["pr_reply_markers"]
+            st.session_state["manual_brand_sure_drop"] = profile["brand_sure_drop"]
+            st.session_state["manual_homonym_noise"] = profile.get(
+                "homonym_noise", [])
+
+        st.markdown("</div>", unsafe_allow_html=True)
+        return profile, extra_brand_patterns
+
+    def system_prompt_section(self, profile: Dict[str, Any]) -> str:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("System prompt template (шаблон)")
+
+        base_template = st.text_area(
+            "Шаблон (можно править)",
+            value=st.session_state.get("base_template", BASE_SYSTEM_TEMPLATE),
+            height=220,
         )
-        return rows, dt
+        st.session_state["base_template"] = base_template
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(one_job, b) for b in batches]
-        done = 0
-        for f in as_completed(futs):
-            rows, dt = f.result()
-            llm_rows.extend(rows)
-            batch_latencies.append(dt)
-            done += 1
-            # прогресс обновим снаружи (в UI), тут просто собираем
+        final_system = format_system_prompt(base_template, profile)
+        with st.expander("Preview: итоговый system prompt"):
+            st.code(final_system, language="text")
 
-    # 4) merge actions
-    for r in llm_rows:
-        idx = int(r["global_idx"])
-        actions[idx] = r["action"]
+        st.markdown("</div>", unsafe_allow_html=True)
+        return final_system
 
-    total_s = time.perf_counter() - t0_total
-    llm_calls = len(batches)
+    def ensure_ready(self):
+        if _IMPORT_ERR is not None:
+            st.error("Не найдены файлы llm_model.py и/или filter_service.py.")
+            st.code(str(_IMPORT_ERR), language="text")
+            st.stop()
 
-    return actions, {
-        "total_s": total_s,
-        "n": len(clean),
-        "rule_drops": rule_drop_count,
-        "llm_calls": llm_calls,
-        "comments_per_s": (len(clean) / total_s) if total_s > 0 else None,
-        "mean_batch_latency_s": (sum(batch_latencies) / len(batch_latencies)) if batch_latencies else None,
-    }
+        if not self.api_key_present:
+            st.warning(
+                "Не найден OPENAI_API_KEY. Добавь ключ в env или Streamlit secrets.")
+            # не стопаем — пусть UI открывается, но запуск заблокируем по кнопке
 
+    def render_single(
+        self,
+        *,
+        profile: Dict[str, Any],
+        final_system: str,
+        extra_brand_patterns: str,
+        model: str,
+        temperature: float,
+        truncate_chars: int,
+    ):
+        st.subheader("Комментарий (один)")
 
-def rule_based_sure_drop(text: str, profile: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    """
-    Возвращает {"action":"drop","reason_code":"..."} если это ТОЧНО drop.
-    Иначе None (пусть решает LLM).
-    """
-    t = (text or "").strip()
-    if not t:
-        return None
+        single_text = st.text_area(
+            "Вставь текст",
+            height=180,
+            placeholder="Один комментарий сюда…",
+            key="single_text",
+        )
+        run_one = st.button("🚀 Запустить", type="primary",
+                            use_container_width=True, key="run_one_btn")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # 1) PR/официальный ответ (очень часто начинается с приветствия)
-    pr_markers = profile.get("pr_reply_markers") or []
-    pr_hit = _match_any(pr_markers + _DEFAULT_PR_MARKERS, t)
-    if pr_hit:
-        return {"action": "drop", "reason_code": "pr_reply"}
+        if not run_one:
+            return
 
-    # 2) Хардовый найм: если есть ключевики + телефон/контакты — почти железно
-    # (чтобы не резать обсуждения типа "как устроиться" без контактов — держим “строгим”)
-    hiring_keywords = [
-        r"(?i)\bваканси\w+\b",
-        r"(?i)\bтребу(ется|ются)\b",
-        r"(?i)\bподработк\w+\b",
-        r"(?i)\bработа\b",
-        r"(?i)\bнабор\b",
-        r"(?i)\bсобеседовани\w+\b",
-    ]
-    if _match_any(hiring_keywords, t) and _PHONE_RE.search(t):
-        return {"action": "drop", "reason_code": "hiring"}
+        if not self.api_key_present:
+            st.error("Нет OPENAI_API_KEY — добавь ключ в Secrets.")
+            st.stop()
 
-    # 3) Бренд-специфичные “точно drop” паттерны из карточки
-    sure_drop_patterns = profile.get("sure_drop_patterns") or []
-    hit = _match_any(sure_drop_patterns, t)
-    if hit:
-        return {"action": "drop", "reason_code": "brand_sure_drop"}
+        # preprocessor под текущий профиль/паттерны
+        preproc_factory = PreprocessorFactory(max_words=250)
+        pre = preproc_factory.make(profile, extra_brand_patterns)
 
-    return None
+        def preprocess_fn(text_rule: str) -> str:
+            return preproc_factory.preprocess_for_llm(text_rule, pre)
 
+        client = get_client()
+        llm = OpenAIRelevanceBatchModel(client=client, default_model=model)
+        service = RelevanceFilterService(llm=llm)
 
-# ---------------- UI ----------------
-st.title("Relevance Filter")
-st.caption("Карточка бренда + строгие правила «точно drop» перед LLM.")
+        with st.spinner("Фильтрую…"):
+            t0 = time.perf_counter()
+            res = service.classify_one(
+                raw_text=single_text,
+                profile=profile,
+                system_prompt=final_system,
+                preprocess_fn=preprocess_fn,
+                truncate_chars=truncate_chars,
+                model=model,
+                temperature=temperature,
+            )
+            total_dt = time.perf_counter() - t0
 
-brands = load_brands("brands.yaml")
+        action = res.get("action", "keep")
+        is_drop = action == "drop"
+        source = res.get("source", "llm")
 
-with st.sidebar:
-    st.subheader("Настройки")
-    model = st.text_input("Model", value=DEFAULT_MODEL)
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
-    truncate_chars = st.number_input(
-        "Truncate chars", min_value=100, max_value=5000, value=800, step=50)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.header("Результат")
 
-    brand_names = ["(manual)"] + sorted(list(brands.keys()))
-    chosen = st.selectbox("Компания", brand_names, index=0)
+        if is_drop:
+            st.markdown('<span class="badge-drop">DROP</span>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="badge-keep">KEEP</span>',
+                        unsafe_allow_html=True)
 
-    st.markdown('<div class="small-note">Под «manual» можно вставить карточку бренда руками.</div>',
-                unsafe_allow_html=True)
+        if source == "rule":
+            st.markdown(' <span class="badge-rule">RULE</span>',
+                        unsafe_allow_html=True)
+            st.caption(
+                f"Pre-LLM правило: {res.get('rule', {}).get('rule_code', 'rule')}")
+        else:
+            st.caption(
+                f"Latency (batch): {res.get('latency_s', 0.0):.3f}s • total: {total_dt:.3f}s")
 
-api_key_present = bool(get_api_key())
-if not api_key_present:
-    st.warning(
-        "Не найден OPENAI_API_KEY. Добавь ключ в env или Streamlit secrets.")
+        st.subheader("JSON")
+        st.json({"results": [{"global_idx": 0, "action": action}]})
+        st.markdown("</div>", unsafe_allow_html=True)
 
-# Профиль бренда (из файла или ручной)
-if chosen != "(manual)" and chosen in brands:
-    profile = dict(brands[chosen])
-else:
-    profile = {
-        "brand_name": st.session_state.get("manual_brand_name", "BRAND"),
-        "description": st.session_state.get("manual_description", ""),
-        "aliases": st.session_state.get("manual_aliases", []),
-        "sure_drop_patterns": st.session_state.get("manual_sure_drop_patterns", []),
-        "pr_reply_markers": st.session_state.get("manual_pr_reply_markers", []),
-    }
+    def render_file(
+        self,
+        *,
+        profile: Dict[str, Any],
+        final_system: str,
+        extra_brand_patterns: str,
+        model: str,
+        temperature: float,
+        truncate_chars: int,
+        batch_size: int,
+        max_workers: int,
+    ):
+        st.subheader("Загрузка файла")
+        uploaded = st.file_uploader(
+            "CSV или Excel. Обязательный столбец: Текст", type=["csv", "xlsx", "xls"])
+        run_file = st.button("🚀 Обработать файл",
+                             type="primary", use_container_width=True)
 
-# --- редактирование карточки бренда в UI ---
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("Карточка бренда")
+        if not run_file:
+            return
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    brand_name = st.text_input(
-        "Brand name", value=profile.get("brand_name", "BRAND"))
-with col2:
-    aliases_raw = st.text_input(
-        "Aliases (через запятую)",
-        value=", ".join(profile.get("aliases") or []),
-        placeholder="familia, фамилия, ...",
-    )
-
-description = st.text_area(
-    "Описание бренда (контекст)",
-    value=profile.get("description", ""),
-    height=140,
-    placeholder="Кто это, что продаёт/делает, какие каналы (приложение/сайт), что считаем релевантным…",
-)
-
-with st.expander("Правила «точно drop» (бренд-специфичные регэкспы)"):
-    sure_drop_list = profile.get("sure_drop_patterns") or []
-    sure_drop_text = st.text_area(
-        "По одному паттерну в строке",
-        value="\n".join(sure_drop_list),
-        height=140,
-        placeholder=r'(?i)\bsagrada\s+familia\b',
-    )
-
-with st.expander("Маркеры PR/официальных ответов (регэкспы)"):
-    pr_list = profile.get("pr_reply_markers") or []
-    pr_text = st.text_area(
-        "По одному паттерну в строке",
-        value="\n".join(pr_list),
-        height=120,
-        placeholder=r"(?i)^здравствуйте",
-    )
-
-# обновим профиль из UI
-profile["brand_name"] = brand_name.strip() if brand_name.strip() else "BRAND"
-profile["aliases"] = [a.strip() for a in aliases_raw.split(",") if a.strip()]
-profile["description"] = description.strip()
-profile["sure_drop_patterns"] = [line.strip()
-                                 for line in sure_drop_text.splitlines() if line.strip()]
-profile["pr_reply_markers"] = [line.strip()
-                               for line in pr_text.splitlines() if line.strip()]
-
-# если manual — запомним в session_state, чтобы не терялось
-if chosen == "(manual)":
-    st.session_state["manual_brand_name"] = profile["brand_name"]
-    st.session_state["manual_aliases"] = profile["aliases"]
-    st.session_state["manual_description"] = profile["description"]
-    st.session_state["manual_sure_drop_patterns"] = profile["sure_drop_patterns"]
-    st.session_state["manual_pr_reply_markers"] = profile["pr_reply_markers"]
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-# --- system prompt template ---
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("System prompt template (шаблон)")
-
-base_template = st.text_area(
-    "Шаблон (можно править)",
-    value=st.session_state.get("base_template", BASE_SYSTEM_TEMPLATE),
-    height=220,
-)
-st.session_state["base_template"] = base_template
-
-final_system = format_system_prompt(base_template, profile)
-
-with st.expander("Preview: итоговый system prompt"):
-    st.code(final_system, language="text")
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-# --- input comment + run ---
-st.markdown('<div class="card">', unsafe_allow_html=True)
-mode = st.radio("Режим", ["Один комментарий",
-                "Файл (CSV/XLSX)"], horizontal=True)
-
-# доп. настройки для батчинга (в sidebar или тут)
-with st.sidebar:
-    st.subheader("Параллельная обработка (для файлов)")
-    batch_size = st.number_input("Batch size", 1, 50, 6, 1)
-    max_workers = st.number_input("Max workers", 1, 20, 3, 1)
-
-if mode == "Файл (CSV/XLSX)":
-    st.subheader("Загрузка файла")
-    uploaded = st.file_uploader(
-        "CSV или Excel. Обязательный столбец: Текст", type=["csv", "xlsx", "xls"])
-    run_file = st.button("🚀 Обработать файл",
-                         type="primary", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    if run_file:
-        if not api_key_present:
+        if not self.api_key_present:
             st.error("Нет OPENAI_API_KEY — добавь ключ в Secrets.")
             st.stop()
 
@@ -574,22 +527,29 @@ if mode == "Файл (CSV/XLSX)":
 
         texts = df_in["Текст"].astype(str).tolist()
 
+        preproc_factory = PreprocessorFactory(max_words=250)
+        pre = preproc_factory.make(profile, extra_brand_patterns)
+
+        def preprocess_fn(text_rule: str) -> str:
+            return preproc_factory.preprocess_for_llm(text_rule, pre)
+
         client = get_client()
+        llm = OpenAIRelevanceBatchModel(client=client, default_model=model)
+        service = RelevanceFilterService(llm=llm)
 
         with st.spinner("Фильтрую (RULE + LLM батчами)…"):
-            actions, stats = run_filter_parallel_for_texts(
-                texts,
-                client=client,
-                model=model,
-                system_prompt=final_system,
+            actions, stats = service.classify_many_parallel(
+                texts=texts,
                 profile=profile,
+                system_prompt=final_system,
+                preprocess_fn=preprocess_fn,
+                batch_size=batch_size,
+                max_workers=max_workers,
+                truncate_chars=truncate_chars,
+                model=model,
                 temperature=temperature,
-                batch_size=int(batch_size),
-                max_workers=int(max_workers),
-                truncate_chars=int(truncate_chars),
             )
 
-        # actions -> is_drop Yes/No
         is_drop = ["Yes" if a == "drop" else "No" for a in actions]
         df_out = pd.DataFrame({"Текст": texts, "is_drop": is_drop})
 
@@ -597,18 +557,18 @@ if mode == "Файл (CSV/XLSX)":
         st.subheader("Готово")
 
         st.caption(
-            f"Строк: {stats['n']} • RULE drops: {stats['rule_drops']} • LLM calls: {stats['llm_calls']} • "
-            f"Total: {stats['total_s']:.2f}s • comments/s: {stats['comments_per_s']:.2f}"
+            f"Строк: {stats.get('n', len(texts))} • RULE drops: {stats.get('rule_drops', 0)} • "
+            f"LLM calls: {stats.get('llm_calls', 0)} • Total: {stats.get('total_s', 0.0):.2f}s • "
+            f"comments/s: {stats.get('comments_per_s', 0.0) or 0.0:.2f}"
         )
 
         st.dataframe(df_out.head(20), use_container_width=True)
 
-        # download in same-ish format
         name = (uploaded.name or "result").lower()
         out_fmt = "xlsx" if name.endswith((".xlsx", ".xls")) else "csv"
         out_bytes, mime = df_to_download_bytes(df_out, out_fmt=out_fmt)
-
         out_name = f"filtered_{Path(uploaded.name).stem}.{out_fmt}"
+
         st.download_button(
             "⬇️ Скачать результат",
             data=out_bytes,
@@ -616,75 +576,43 @@ if mode == "Файл (CSV/XLSX)":
             mime=mime,
             use_container_width=True,
         )
-
         st.markdown("</div>", unsafe_allow_html=True)
-else:
-    comment = st.text_area(
-        "Вставь текст",
-        value=st.session_state.get("comment", ""),
-        height=140,
-        placeholder="Один комментарий сюда…",
-    )
-    st.session_state["comment"] = comment
 
-    run_one = st.button("🚀 Запустить", type="primary",
-                        use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    def run(self):
+        st.title("Relevance Filter")
+        st.caption(
+            "Карточка бренда + строгие правила «точно drop» перед LLM + предобработка + батчи для файлов.")
 
-    # --- run logic ---
-    if run_one:
-        if not api_key_present:
-            st.error("Нет OPENAI_API_KEY — добавь ключ и перезапусти приложение.")
-            st.stop()
+        self.ensure_ready()
 
-        c = prepare_comment(comment, truncate_chars=truncate_chars)
-        if not c:
-            st.error("Комментарий пустой — вставь текст.")
-            st.stop()
+        settings = self.sidebar_settings()
+        profile, extra_brand_patterns = self.brand_profile_editor(
+            settings["chosen"])
+        final_system = self.system_prompt_section(profile)
 
-        # 1) Pre-LLM sure-drop rules
-        rule_hit = rule_based_sure_drop(c, profile)
+        mode = st.radio("Режим", ["Один комментарий",
+                        "Файл (CSV/XLSX)"], horizontal=True)
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("Результат")
+        if mode == "Файл (CSV/XLSX)":
+            self.render_file(
+                profile=profile,
+                final_system=final_system,
+                extra_brand_patterns=extra_brand_patterns,
+                model=settings["model"],
+                temperature=settings["temperature"],
+                truncate_chars=settings["truncate_chars"],
+                batch_size=settings["batch_size"],
+                max_workers=settings["max_workers"],
+            )
+        else:
+            self.render_single(
+                profile=profile,
+                final_system=final_system,
+                extra_brand_patterns=extra_brand_patterns,
+                model=settings["model"],
+                temperature=settings["temperature"],
+                truncate_chars=settings["truncate_chars"],
+            )
 
-        if rule_hit is not None:
-            # строгое drop без LLM
-            st.markdown(
-                '<span class="badge-drop">DROP</span> <span class="badge-rule">RULE</span>', unsafe_allow_html=True)
-            st.caption(f"Pre-LLM правило сработало: {rule_hit['reason_code']}")
-            st.write("JSON:")
-            st.json({"results": [{"global_idx": 0, "action": "drop"}]})
-            st.markdown("</div>", unsafe_allow_html=True)
-            st.stop()
 
-        # 2) LLM classification
-        client = get_client()
-        with st.spinner("Классифицирую через LLM…"):
-            try:
-                rows, dt = classify_batch(
-                    batch=[(0, c)],
-                    client=client,
-                    model=model,
-                    system_prompt=final_system,
-                    temperature=temperature,
-                    max_retries=6,
-                )
-                action = rows[0]["action"]
-
-                if action == "keep":
-                    st.markdown('<span class="badge-keep">KEEP</span>',
-                                unsafe_allow_html=True)
-                else:
-                    st.markdown('<span class="badge-drop">DROP</span>',
-                                unsafe_allow_html=True)
-
-                st.caption(f"Latency: {dt:.3f}s")
-                st.write("JSON:")
-                st.json({"results": [{"global_idx": 0, "action": action}]})
-
-            except Exception as e:
-                st.error("Ошибка при запросе/парсинге.")
-                st.exception(e)
-
-        st.markdown("</div>", unsafe_allow_html=True)
+StreamlitRelevanceApp().run()
