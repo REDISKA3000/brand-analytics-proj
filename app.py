@@ -9,6 +9,13 @@ import yaml
 from pydantic import BaseModel
 from openai import OpenAI
 import openai  # exceptions
+
+import io
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+
 try:
     from config_local import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
 except Exception:
@@ -137,6 +144,43 @@ def get_client() -> OpenAI:
 
 
 # ---------------- LLM helpers ----------------
+def read_uploaded_table(uploaded_file) -> pd.DataFrame:
+    name = (uploaded_file.name or "").lower()
+
+    if name.endswith((".xlsx", ".xls")):
+        # Excel
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+
+    # CSV: пытаемся угадать разделитель
+    data = uploaded_file.getvalue()
+    bio = io.BytesIO(data)
+    try:
+        return pd.read_csv(bio, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception:
+        # fallback: часто бывает ;
+        bio = io.BytesIO(data)
+        try:
+            return pd.read_csv(bio, sep=";", encoding="utf-8-sig")
+        except Exception:
+            bio = io.BytesIO(data)
+            return pd.read_csv(bio, sep=",", encoding="utf-8-sig")
+
+
+def df_to_download_bytes(df: pd.DataFrame, out_fmt: str) -> tuple[bytes, str]:
+    """
+    out_fmt: "csv" | "xlsx"
+    returns: (bytes, mime)
+    """
+    if out_fmt == "xlsx":
+        buff = io.BytesIO()
+        with pd.ExcelWriter(buff, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="result")
+        return buff.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    # csv
+    return df.to_csv(index=False).encode("utf-8-sig"), "text/csv"
+
+
 def build_prompt(batch: List[Tuple[int, str]]) -> str:
     lines = [
         "Для каждой строки верни action=keep|drop.",
@@ -224,6 +268,118 @@ def _match_any(patterns: List[str], text: str) -> Optional[str]:
             # если кто-то положил плохую регэкспу — не падаем
             continue
     return None
+
+
+def chunk_list(lst, n: int):
+    return [lst[i: i + n] for i in range(0, len(lst), n)]
+
+
+def run_filter_parallel_for_texts(
+    texts: List[str],
+    *,
+    client: OpenAI,
+    model: str,
+    system_prompt: str,
+    profile: Dict[str, Any],
+    temperature: float = 0.0,
+    batch_size: int = 6,
+    max_workers: int = 3,
+    truncate_chars: int = 800,
+) -> tuple[List[str], Dict[str, Any]]:
+    """
+    Возвращает:
+      - actions: список action для каждого текста ("keep"/"drop") в исходном порядке
+      - stats: метрики
+    """
+
+    t0_total = time.perf_counter()
+
+    # 0) prepare texts
+    clean = [prepare_comment(t, truncate_chars=truncate_chars) for t in texts]
+
+    # 1) rule-based drops first
+    actions = [None] * len(clean)
+    to_llm_pairs: List[Tuple[int, str]] = []
+
+    rule_drop_count = 0
+    for i, t in enumerate(clean):
+        hit = rule_based_sure_drop(t, profile)
+        if hit is not None:
+            actions[i] = "drop"
+            rule_drop_count += 1
+        else:
+            to_llm_pairs.append((i, t))
+
+    # если всё отрезалось правилами — LLM не нужен
+    if not to_llm_pairs:
+        total_s = time.perf_counter() - t0_total
+        return actions, {
+            "total_s": total_s,
+            "n": len(clean),
+            "rule_drops": rule_drop_count,
+            "llm_calls": 0,
+            "comments_per_s": (len(clean) / total_s) if total_s > 0 else None,
+            "mean_batch_latency_s": None,
+        }
+
+    # 2) chunk to LLM batches
+    batches = chunk_list(to_llm_pairs, batch_size)
+
+    # warmup (не обязателен, но можно оставить)
+    try:
+        _rows, _dt = classify_batch(
+            batch=batches[0],
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_retries=6,
+        )
+    except Exception:
+        # если warmup упал — не блокируем пайплайн
+        pass
+
+    # 3) parallel LLM
+    llm_rows = []
+    batch_latencies = []
+
+    def one_job(batch):
+        rows, dt = classify_batch(
+            batch=batch,
+            client=client,
+            model=model,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_retries=6,
+        )
+        return rows, dt
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(one_job, b) for b in batches]
+        done = 0
+        for f in as_completed(futs):
+            rows, dt = f.result()
+            llm_rows.extend(rows)
+            batch_latencies.append(dt)
+            done += 1
+            # прогресс обновим снаружи (в UI), тут просто собираем
+
+    # 4) merge actions
+    for r in llm_rows:
+        idx = int(r["global_idx"])
+        actions[idx] = r["action"]
+
+    total_s = time.perf_counter() - t0_total
+    llm_calls = len(batches)
+
+    return actions, {
+        "total_s": total_s,
+        "n": len(clean),
+        "rule_drops": rule_drop_count,
+        "llm_calls": llm_calls,
+        "comments_per_s": (len(clean) / total_s) if total_s > 0 else None,
+        "mean_batch_latency_s": (sum(batch_latencies) / len(batch_latencies)) if batch_latencies else None,
+    }
 
 
 def rule_based_sure_drop(text: str, profile: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -378,73 +534,157 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 # --- input comment + run ---
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("Комментарий (один)")
+mode = st.radio("Режим", ["Один комментарий",
+                "Файл (CSV/XLSX)"], horizontal=True)
 
-comment = st.text_area(
-    "Вставь текст",
-    value=st.session_state.get("comment", ""),
-    height=140,
-    placeholder="Один комментарий сюда…",
-)
-st.session_state["comment"] = comment
+# доп. настройки для батчинга (в sidebar или тут)
+with st.sidebar:
+    st.subheader("Параллельная обработка (для файлов)")
+    batch_size = st.number_input("Batch size", 1, 50, 6, 1)
+    max_workers = st.number_input("Max workers", 1, 20, 3, 1)
 
-run = st.button("🚀 Запустить", type="primary", use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
+if mode == "Файл (CSV/XLSX)":
+    st.subheader("Загрузка файла")
+    uploaded = st.file_uploader(
+        "CSV или Excel. Обязательный столбец: Текст", type=["csv", "xlsx", "xls"])
+    run_file = st.button("🚀 Обработать файл",
+                         type="primary", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# --- run logic ---
-if run:
-    if not api_key_present:
-        st.error("Нет OPENAI_API_KEY — добавь ключ и перезапусти приложение.")
-        st.stop()
+    if run_file:
+        if not api_key_present:
+            st.error("Нет OPENAI_API_KEY — добавь ключ в Secrets.")
+            st.stop()
 
-    c = prepare_comment(comment, truncate_chars=truncate_chars)
-    if not c:
-        st.error("Комментарий пустой — вставь текст.")
-        st.stop()
+        if uploaded is None:
+            st.error("Загрузи файл CSV/XLSX.")
+            st.stop()
 
-    # 1) Pre-LLM sure-drop rules
-    rule_hit = rule_based_sure_drop(c, profile)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Результат")
-
-    if rule_hit is not None:
-        # строгое drop без LLM
-        st.markdown(
-            '<span class="badge-drop">DROP</span> <span class="badge-rule">RULE</span>', unsafe_allow_html=True)
-        st.caption(f"Pre-LLM правило сработало: {rule_hit['reason_code']}")
-        st.write("JSON:")
-        st.json({"results": [{"global_idx": 0, "action": "drop"}]})
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.stop()
-
-    # 2) LLM classification
-    client = get_client()
-    with st.spinner("Классифицирую через LLM…"):
         try:
-            rows, dt = classify_batch(
-                batch=[(0, c)],
+            df_in = read_uploaded_table(uploaded)
+        except Exception as e:
+            st.error("Не смог прочитать файл. Проверь формат CSV/XLSX.")
+            st.exception(e)
+            st.stop()
+
+        if "Текст" not in df_in.columns:
+            st.error(
+                f"В файле нет столбца 'Текст'. Есть: {list(df_in.columns)}")
+            st.stop()
+
+        texts = df_in["Текст"].astype(str).tolist()
+
+        client = get_client()
+
+        with st.spinner("Фильтрую (RULE + LLM батчами)…"):
+            actions, stats = run_filter_parallel_for_texts(
+                texts,
                 client=client,
                 model=model,
                 system_prompt=final_system,
+                profile=profile,
                 temperature=temperature,
-                max_retries=6,
+                batch_size=int(batch_size),
+                max_workers=int(max_workers),
+                truncate_chars=int(truncate_chars),
             )
-            action = rows[0]["action"]
 
-            if action == "keep":
-                st.markdown('<span class="badge-keep">KEEP</span>',
-                            unsafe_allow_html=True)
-            else:
-                st.markdown('<span class="badge-drop">DROP</span>',
-                            unsafe_allow_html=True)
+        # actions -> is_drop Yes/No
+        is_drop = ["Yes" if a == "drop" else "No" for a in actions]
+        df_out = pd.DataFrame({"Текст": texts, "is_drop": is_drop})
 
-            st.caption(f"Latency: {dt:.3f}s")
-            st.write("JSON:")
-            st.json({"results": [{"global_idx": 0, "action": action}]})
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("Готово")
 
-        except Exception as e:
-            st.error("Ошибка при запросе/парсинге.")
-            st.exception(e)
+        st.caption(
+            f"Строк: {stats['n']} • RULE drops: {stats['rule_drops']} • LLM calls: {stats['llm_calls']} • "
+            f"Total: {stats['total_s']:.2f}s • comments/s: {stats['comments_per_s']:.2f}"
+        )
 
+        st.dataframe(df_out.head(20), use_container_width=True)
+
+        # download in same-ish format
+        name = (uploaded.name or "result").lower()
+        out_fmt = "xlsx" if name.endswith((".xlsx", ".xls")) else "csv"
+        out_bytes, mime = df_to_download_bytes(df_out, out_fmt=out_fmt)
+
+        out_name = f"filtered_{Path(uploaded.name).stem}.{out_fmt}"
+        st.download_button(
+            "⬇️ Скачать результат",
+            data=out_bytes,
+            file_name=out_name,
+            mime=mime,
+            use_container_width=True,
+        )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+else:
+    comment = st.text_area(
+        "Вставь текст",
+        value=st.session_state.get("comment", ""),
+        height=140,
+        placeholder="Один комментарий сюда…",
+    )
+    st.session_state["comment"] = comment
+
+    run_one = st.button("🚀 Запустить", type="primary",
+                        use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- run logic ---
+    if run_one:
+        if not api_key_present:
+            st.error("Нет OPENAI_API_KEY — добавь ключ и перезапусти приложение.")
+            st.stop()
+
+        c = prepare_comment(comment, truncate_chars=truncate_chars)
+        if not c:
+            st.error("Комментарий пустой — вставь текст.")
+            st.stop()
+
+        # 1) Pre-LLM sure-drop rules
+        rule_hit = rule_based_sure_drop(c, profile)
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader("Результат")
+
+        if rule_hit is not None:
+            # строгое drop без LLM
+            st.markdown(
+                '<span class="badge-drop">DROP</span> <span class="badge-rule">RULE</span>', unsafe_allow_html=True)
+            st.caption(f"Pre-LLM правило сработало: {rule_hit['reason_code']}")
+            st.write("JSON:")
+            st.json({"results": [{"global_idx": 0, "action": "drop"}]})
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.stop()
+
+        # 2) LLM classification
+        client = get_client()
+        with st.spinner("Классифицирую через LLM…"):
+            try:
+                rows, dt = classify_batch(
+                    batch=[(0, c)],
+                    client=client,
+                    model=model,
+                    system_prompt=final_system,
+                    temperature=temperature,
+                    max_retries=6,
+                )
+                action = rows[0]["action"]
+
+                if action == "keep":
+                    st.markdown('<span class="badge-keep">KEEP</span>',
+                                unsafe_allow_html=True)
+                else:
+                    st.markdown('<span class="badge-drop">DROP</span>',
+                                unsafe_allow_html=True)
+
+                st.caption(f"Latency: {dt:.3f}s")
+                st.write("JSON:")
+                st.json({"results": [{"global_idx": 0, "action": action}]})
+
+            except Exception as e:
+                st.error("Ошибка при запросе/парсинге.")
+                st.exception(e)
+
+        st.markdown("</div>", unsafe_allow_html=True)
