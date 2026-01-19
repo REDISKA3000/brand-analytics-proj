@@ -26,6 +26,20 @@ except Exception as e:
 else:
     _IMPORT_ERR = None
 
+# Sentiment stack (может отсутствовать/ломаться из-за deps — тогда просто выключим функционал)
+try:
+    from embedders import OpenAIEmbedder
+    from sentiment_model import SentimentModel, SentimentModelConfig
+    from sentiment_service import SentimentService
+except Exception as e:
+    OpenAIEmbedder = None
+    SentimentModel = None
+    SentimentModelConfig = None
+    SentimentService = None
+    _SENTIMENT_IMPORT_ERR = e
+else:
+    _SENTIMENT_IMPORT_ERR = None
+
 try:
     from config_local import OPENAI_API_KEY as LOCAL_OPENAI_API_KEY
 except Exception:
@@ -34,7 +48,7 @@ except Exception:
 
 # ---------------- UI CONFIG ----------------
 st.set_page_config(
-    page_title="Relevance Filter",
+    page_title="Brand Analytics (MVP)",
     page_icon="🧼",
     layout="centered",
 )
@@ -44,6 +58,7 @@ st.markdown(
 <style>
 .block-container { padding-top: 2rem; max-width: 980px; }
 .small-note { opacity: 0.75; font-size: 0.92rem; }
+
 .card {
   background: white;
   border: 1px solid rgba(0,0,0,0.06);
@@ -52,17 +67,48 @@ st.markdown(
   box-shadow: 0 6px 20px rgba(0,0,0,0.04);
   margin-bottom: 14px;
 }
-.badge-keep, .badge-drop, .badge-rule {
-  display:inline-block;
-  padding: 6px 10px;
+
+/* ====== BADGES (unified) ====== */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 6px 12px;
   border-radius: 999px;
+
   font-weight: 800;
   font-size: 0.9rem;
-  border: 1px solid rgba(0,0,0,0.08);
+  line-height: 1;
+
+  border: 1px solid rgba(0,0,0,0.10);
+  color: #111827;
+  background: rgba(17,24,39,0.06);
+
+  margin-right: 10px; /* одинаковый отступ между бейджами */
 }
-.badge-keep { background: rgba(34,197,94,0.12); }
-.badge-drop { background: rgba(239,68,68,0.12); }
-.badge-rule { background: rgba(59,130,246,0.12); }
+
+/* Green (KEEP / POSITIVE) */
+.badge--green { background: rgba(34,197,94,0.12); }
+
+/* Red (DROP / NEGATIVE) */
+.badge--red { background: rgba(239,68,68,0.12); }
+
+/* Neutral (NEUTRAL) */
+.badge--gray { background: rgba(107,114,128,0.14); }
+
+/* Rule (optional) */
+.badge--blue { background: rgba(59,130,246,0.12); }
+
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+.badge { margin-right: 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -89,6 +135,42 @@ BASE_SYSTEM_TEMPLATE = """
 - Возвращай строго JSON по схеме.
 - Никаких пояснений, причин, текста — только JSON.
 """.strip()
+
+
+# ---------------- Helpers: sentiment meta/cache ----------------
+def _sentiment_available() -> bool:
+    return (OpenAIEmbedder is not None) and (SentimentModel is not None) and (SentimentService is not None)
+
+
+def _read_sentiment_meta(npz_path: str) -> dict:
+    yml = Path(npz_path).with_suffix(".yaml")
+    if yml.exists():
+        try:
+            with open(yml, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+    return {}
+
+
+@st.cache_resource
+def get_sentiment_model_cached(api_key: str, artifacts_npz: str, openai_embed_model: str, dimensions: int | None):
+    """
+    Загружаем прототипы/пороги из .npz и создаём модель с OpenAI embeddings (для прод-инференса).
+    """
+    if not _sentiment_available():
+        raise RuntimeError(
+            f"Sentiment stack is not available: {_SENTIMENT_IMPORT_ERR}")
+
+    client = OpenAI(api_key=api_key)
+    embedder = OpenAIEmbedder(
+        client=client, model=openai_embed_model, dimensions=dimensions)
+
+    cfg = SentimentModelConfig(enable_llm_fallback=False)
+    m = SentimentModel(embed_fn=embedder.embed_texts,
+                       config=cfg, openai_api_key=api_key)
+    m.load_artifacts(artifacts_npz)
+    return m
 
 
 # ---------------- Helpers: brands ----------------
@@ -251,10 +333,17 @@ class StreamlitRelevanceApp:
             st.subheader("Настройки")
             model = st.text_input(
                 "Model", value=st.session_state.get("model", DEFAULT_MODEL))
-            temperature = st.slider("Temperature", 0.0, 1.0, float(
-                st.session_state.get("temperature", 0.0)), 0.1)
-            truncate_chars = st.number_input("Truncate chars", min_value=100, max_value=5000, value=int(
-                st.session_state.get("truncate_chars", 800)), step=50)
+            temperature = st.slider(
+                "Temperature", 0.0, 1.0, float(
+                    st.session_state.get("temperature", 0.0)), 0.1
+            )
+            truncate_chars = st.number_input(
+                "Truncate chars",
+                min_value=100,
+                max_value=5000,
+                value=int(st.session_state.get("truncate_chars", 800)),
+                step=50,
+            )
 
             st.session_state["model"] = model
             st.session_state["temperature"] = temperature
@@ -266,15 +355,59 @@ class StreamlitRelevanceApp:
             st.session_state["chosen_idx"] = brand_names.index(chosen)
 
             st.markdown(
-                '<div class="small-note">Под «manual» можно вставить карточку бренда руками.</div>', unsafe_allow_html=True)
+                '<div class="small-note">Под «manual» можно вставить карточку бренда руками.</div>',
+                unsafe_allow_html=True,
+            )
 
             st.subheader("Параллельная обработка (для файлов)")
-            batch_size = st.number_input("Batch size", 1, 50, int(
-                st.session_state.get("batch_size", 6)), 1)
-            max_workers = st.number_input("Max workers", 1, 20, int(
-                st.session_state.get("max_workers", 3)), 1)
+            batch_size = st.number_input(
+                "Batch size", 1, 50, int(
+                    st.session_state.get("batch_size", 6)), 1
+            )
+            max_workers = st.number_input(
+                "Max workers", 1, 20, int(
+                    st.session_state.get("max_workers", 3)), 1
+            )
             st.session_state["batch_size"] = int(batch_size)
             st.session_state["max_workers"] = int(max_workers)
+
+            st.subheader("Sentiment")
+            enable_sentiment = st.checkbox(
+                "Run sentiment after relevance",
+                value=bool(st.session_state.get("enable_sentiment", True)),
+            )
+            sentiment_only_kept = st.checkbox(
+                "Analyze only kept (is_drop=No)",
+                value=bool(st.session_state.get("sentiment_only_kept", True)),
+            )
+            sentiment_artifacts = st.text_input(
+                "Sentiment artifacts (.npz)",
+                value=st.session_state.get(
+                    "sentiment_artifacts", "sentiment_assets/sentiment_openai.npz"),
+            )
+
+            meta = _read_sentiment_meta(sentiment_artifacts)
+            default_embed_model = (
+                (meta.get("embedding", {}) or {}).get(
+                    "model") or "text-embedding-3-small"
+            )
+            sentiment_embed_model = st.text_input(
+                "OpenAI embedding model",
+                value=st.session_state.get(
+                    "sentiment_embed_model", default_embed_model),
+            )
+            sentiment_embed_batch = st.number_input(
+                "Embedding batch size", 16, 512, int(
+                    st.session_state.get("sentiment_embed_batch", 128)), 16
+            )
+
+            st.session_state["enable_sentiment"] = bool(enable_sentiment)
+            st.session_state["sentiment_only_kept"] = bool(sentiment_only_kept)
+            st.session_state["sentiment_artifacts"] = str(sentiment_artifacts)
+            st.session_state["sentiment_embed_model"] = str(
+                sentiment_embed_model)
+            st.session_state["sentiment_embed_batch"] = int(
+                sentiment_embed_batch)
 
         return {
             "model": model,
@@ -283,6 +416,11 @@ class StreamlitRelevanceApp:
             "chosen": chosen,
             "batch_size": int(batch_size),
             "max_workers": int(max_workers),
+            "enable_sentiment": bool(enable_sentiment),
+            "sentiment_only_kept": bool(sentiment_only_kept),
+            "sentiment_artifacts": str(sentiment_artifacts),
+            "sentiment_embed_model": str(sentiment_embed_model),
+            "sentiment_embed_batch": int(sentiment_embed_batch),
         }
 
     def brand_profile_editor(self, chosen: str) -> tuple[Dict[str, Any], str]:
@@ -402,7 +540,49 @@ class StreamlitRelevanceApp:
         if not self.api_key_present:
             st.warning(
                 "Не найден OPENAI_API_KEY. Добавь ключ в env или Streamlit secrets.")
-            # не стопаем — пусть UI открывается, но запуск заблокируем по кнопке
+            # UI оставляем, но запуск блокируем по кнопке
+
+        if _SENTIMENT_IMPORT_ERR is not None:
+            # не стопаем — просто предупреждение (тональность опциональна)
+            st.info(
+                "Sentiment-модуль недоступен (deps/импорты). Включение тональности будет игнорироваться.")
+
+    def _maybe_build_sentiment_service(
+        self,
+        *,
+        preproc_factory: PreprocessorFactory,
+        pre: proc.CommentPreprocessor,
+        artifacts_npz: str,
+        openai_embed_model: str,
+        embed_batch_size: int,
+    ) -> Optional[SentimentService]:
+        if not _sentiment_available():
+            return None
+
+        api_key = get_api_key()
+        if not api_key:
+            return None
+
+        if not Path(artifacts_npz).exists():
+            return None
+
+        def preprocess_fn(text_rule: str) -> str:
+            return preproc_factory.preprocess_for_llm(text_rule, pre)
+
+        try:
+            sent_model = get_sentiment_model_cached(
+                api_key=api_key,
+                artifacts_npz=artifacts_npz,
+                openai_embed_model=openai_embed_model,
+                dimensions=None,
+            )
+            return SentimentService(
+                model=sent_model,
+                preprocess_fn=preprocess_fn,
+                embed_batch_size=int(embed_batch_size),
+            )
+        except Exception:
+            return None
 
     def render_single(
         self,
@@ -413,6 +593,11 @@ class StreamlitRelevanceApp:
         model: str,
         temperature: float,
         truncate_chars: int,
+        enable_sentiment: bool,
+        sentiment_only_kept: bool,
+        sentiment_artifacts: str,
+        sentiment_embed_model: str,
+        sentiment_embed_batch: int,
     ):
         st.subheader("Комментарий (один)")
 
@@ -461,27 +646,111 @@ class StreamlitRelevanceApp:
         is_drop = action == "drop"
         source = res.get("source", "llm")
 
+        sent_label = None
+        sent_source = None
+        sent_scores = None
+        sent_sim_pred = None
+        sent_skipped_reason = None
+
+        # st.markdown('<div class="card">', unsafe_allow_html=True)
+        # st.header("Результат (Relevance)")
+
+        # if is_drop:
+        #     st.markdown('<span class="badge-drop">DROP</span>',
+        #                 unsafe_allow_html=True)
+        # else:
+        #     st.markdown('<span class="badge-keep">KEEP</span>',
+        #                 unsafe_allow_html=True)
+
+        # if source == "rule":
+        #     st.markdown(' <span class="badge-rule">RULE</span>',
+        #                 unsafe_allow_html=True)
+        #     st.caption(
+        #         f"Pre-LLM правило: {res.get('rule', {}).get('rule_code', 'rule')}")
+        # else:
+        #     st.caption(
+        #         f"Latency (batch): {res.get('latency_s', 0.0):.3f}s • total: {total_dt:.3f}s")
+
+        # # Закрываем карточку Relevance
+        # st.markdown("</div>", unsafe_allow_html=True)
+
+        # ---------------- Sentiment after relevance ----------------
+        if enable_sentiment:
+            if sentiment_only_kept and is_drop:
+                sent_skipped_reason = "пропущено (is_drop=Yes)"
+            elif not _sentiment_available():
+                sent_skipped_reason = "модуль недоступен"
+            else:
+                sent_service = self._maybe_build_sentiment_service(
+                    preproc_factory=preproc_factory,
+                    pre=pre,
+                    artifacts_npz=sentiment_artifacts,
+                    openai_embed_model=sentiment_embed_model,
+                    embed_batch_size=sentiment_embed_batch,
+                )
+                if sent_service is None:
+                    sent_skipped_reason = "не удалось инициализировать"
+                else:
+                    with st.spinner("Sentiment inference…"):
+                        sres = sent_service.predict_one(single_text)
+
+                    sent_label = sres.get("label")
+                    sent_source = sres.get("source")
+                    sent_scores = sres.get("scores")
+                    sent_sim_pred = sres.get("sim_pred")
+
+        # # JSON прячем в debug-блок
+        # with st.expander("JSON (debug)", expanded=False):
+        #     st.json({"results": [{"global_idx": 0, "action": action}]})
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.header("Результат")
 
-        if is_drop:
-            st.markdown('<span class="badge-drop">DROP</span>',
-                        unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="badge-keep">KEEP</span>',
-                        unsafe_allow_html=True)
+        # --- Relevance badge ---
+        # бейдж релевантности
+        badges = []
 
+        # Relevance badge
+        if is_drop:
+            badges.append(
+                '<span class="badge badge--red">RELEVANCE: DROP</span>')
+        else:
+            badges.append(
+                '<span class="badge badge--green">RELEVANCE: KEEP</span>')
+
+        # Sentiment badge
+        if enable_sentiment and sent_label:
+            if sent_label == "positive":
+                badges.append(
+                    '<span class="badge badge--green">SENTIMENT: POSITIVE</span>')
+            elif sent_label == "negative":
+                badges.append(
+                    '<span class="badge badge--red">SENTIMENT: NEGATIVE</span>')
+            else:
+                badges.append(
+                    '<span class="badge badge--gray">SENTIMENT: NEUTRAL</span>')
+
+        st.markdown(
+            f'<div class="badge-row">{"".join(badges)}</div>', unsafe_allow_html=True)
+
+        # meta
         if source == "rule":
-            st.markdown(' <span class="badge-rule">RULE</span>',
-                        unsafe_allow_html=True)
             st.caption(
                 f"Pre-LLM правило: {res.get('rule', {}).get('rule_code', 'rule')}")
         else:
             st.caption(
                 f"Latency (batch): {res.get('latency_s', 0.0):.3f}s • total: {total_dt:.3f}s")
 
-        st.subheader("JSON")
-        st.json({"results": [{"global_idx": 0, "action": action}]})
+        # sentiment meta
+        if enable_sentiment and sent_label:
+            st.caption(
+                f"Sentiment source: {sent_source} • sim_pred: {float(sent_sim_pred):.3f}")
+
+        # debug JSON
+        with st.expander("JSON (debug)", expanded=False):
+            st.json({"results": [{"global_idx": 0, "action": action}]})
+            if enable_sentiment and sent_scores is not None:
+                st.json({"sentiment_scores": sent_scores})
+
         st.markdown("</div>", unsafe_allow_html=True)
 
     def render_file(
@@ -495,6 +764,11 @@ class StreamlitRelevanceApp:
         truncate_chars: int,
         batch_size: int,
         max_workers: int,
+        enable_sentiment: bool,
+        sentiment_only_kept: bool,
+        sentiment_artifacts: str,
+        sentiment_embed_model: str,
+        sentiment_embed_batch: int,
     ):
         st.subheader("Загрузка файла")
         uploaded = st.file_uploader(
@@ -553,14 +827,54 @@ class StreamlitRelevanceApp:
         is_drop = ["Yes" if a == "drop" else "No" for a in actions]
         df_out = pd.DataFrame({"Текст": texts, "is_drop": is_drop})
 
+        # ---------------- Sentiment after relevance (file) ----------------
+        if enable_sentiment:
+            if not _sentiment_available():
+                st.warning(
+                    "Sentiment: модуль недоступен (зависимости/импорт).")
+            else:
+                sent_service = self._maybe_build_sentiment_service(
+                    preproc_factory=preproc_factory,
+                    pre=pre,
+                    artifacts_npz=sentiment_artifacts,
+                    openai_embed_model=sentiment_embed_model,
+                    embed_batch_size=sentiment_embed_batch,
+                )
+                if sent_service is None:
+                    st.warning(
+                        "Sentiment: не удалось инициализировать (нет ключа/артефакта или ошибка загрузки).")
+                else:
+                    idxs, to_score = [], []
+                    for i, t in enumerate(texts):
+                        if sentiment_only_kept and df_out.loc[i, "is_drop"] == "Yes":
+                            continue
+                        idxs.append(i)
+                        to_score.append(t)
+
+                    sentiment_col = [""] * len(texts)
+                    sentiment_source_col = [""] * len(texts)
+
+                    if idxs:
+                        with st.spinner("Считаю тональность…"):
+                            labels, sources = sent_service.predict_many(
+                                to_score)
+
+                        for i, lab, src in zip(idxs, labels, sources):
+                            sentiment_col[i] = str(lab)
+                            sentiment_source_col[i] = str(src)
+
+                    df_out["sentiment"] = sentiment_col
+                    df_out["sentiment_source"] = sentiment_source_col
+
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("Готово")
 
-        st.caption(
+        base_caption = (
             f"Строк: {stats.get('n', len(texts))} • RULE drops: {stats.get('rule_drops', 0)} • "
             f"LLM calls: {stats.get('llm_calls', 0)} • Total: {stats.get('total_s', 0.0):.2f}s • "
             f"comments/s: {stats.get('comments_per_s', 0.0) or 0.0:.2f}"
         )
+        st.caption(base_caption)
 
         st.dataframe(df_out.head(20), use_container_width=True)
 
@@ -579,9 +893,11 @@ class StreamlitRelevanceApp:
         st.markdown("</div>", unsafe_allow_html=True)
 
     def run(self):
-        st.title("Relevance Filter")
+        st.title("Brand Analytics (MVP)")
         st.caption(
-            "Карточка бренда + строгие правила «точно drop» перед LLM + предобработка + батчи для файлов.")
+            "Сейчас: Relevance (RULE + LLM) + Sentiment (прототипы) после relevance. "
+            "Дальше добавим смысловые теги."
+        )
 
         self.ensure_ready()
 
@@ -603,6 +919,11 @@ class StreamlitRelevanceApp:
                 truncate_chars=settings["truncate_chars"],
                 batch_size=settings["batch_size"],
                 max_workers=settings["max_workers"],
+                enable_sentiment=settings["enable_sentiment"],
+                sentiment_only_kept=settings["sentiment_only_kept"],
+                sentiment_artifacts=settings["sentiment_artifacts"],
+                sentiment_embed_model=settings["sentiment_embed_model"],
+                sentiment_embed_batch=settings["sentiment_embed_batch"],
             )
         else:
             self.render_single(
@@ -612,6 +933,11 @@ class StreamlitRelevanceApp:
                 model=settings["model"],
                 temperature=settings["temperature"],
                 truncate_chars=settings["truncate_chars"],
+                enable_sentiment=settings["enable_sentiment"],
+                sentiment_only_kept=settings["sentiment_only_kept"],
+                sentiment_artifacts=settings["sentiment_artifacts"],
+                sentiment_embed_model=settings["sentiment_embed_model"],
+                sentiment_embed_batch=settings["sentiment_embed_batch"],
             )
 
 

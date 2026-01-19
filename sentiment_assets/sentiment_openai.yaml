@@ -1,0 +1,14 @@
+k_per_class: 3
+normalize: true
+thresholds:
+  negative: 0.7
+  neutral: 0.6
+  positive: 0.6
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  dimensions: null
+max_words: 250
+text_col: text
+label_col: label
+rows_used: 14999
