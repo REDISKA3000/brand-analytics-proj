@@ -105,7 +105,7 @@ hr { border: none; border-top: 1px solid rgba(0,0,0,0.08); margin: 10px 0; }
     unsafe_allow_html=True,
 )
 
-DEFAULT_LLM_MODEL = "gpt-4.1-mini"
+DEFAULT_LLM_MODEL = "gpt-4.1"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 DEFAULT_SENTIMENT_ARTIFACTS = "sentiment_assets/sentiment_openai.npz"
 
