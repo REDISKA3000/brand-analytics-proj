@@ -1,3 +1,4 @@
+https://brand-analytics-proj-d9enuniaul4vemjntbhqnv.streamlit.app
 # Brand Opinion Analytics 🧭
 
 A project for end-to-end brand opinion analytics from user comments — turning raw UGC into clean, actionable signals for product and marketing.
