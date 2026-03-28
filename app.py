@@ -15,6 +15,7 @@ import yaml
 from openai import OpenAI
 
 import processing as proc  # processing.py рядом с app.py
+from rule_agent import generate_rules
 
 from embedders import OpenAIEmbedder
 from sentiment_model import SentimentModel, SentimentModelConfig
@@ -148,8 +149,9 @@ def load_brands(path: str = "brands.yaml") -> Dict[str, Dict[str, Any]]:
         p.setdefault("sure_drop_patterns", [])
         p.setdefault("pr_reply_markers", [])
         # совместимость с RuleEngine из filter_service.py
-        p.setdefault("brand_sure_drop", p.get("sure_drop_patterns", []))
+        p.setdefault("brand_sure_drop", [])
         p.setdefault("homonym_noise", [])
+        p.setdefault("search_noise_patterns", [])
         out[k] = p
     return out
 
@@ -162,9 +164,11 @@ def normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     p.setdefault("sure_drop_patterns", [])
     p.setdefault("pr_reply_markers", [])
     if "brand_sure_drop" not in p or p["brand_sure_drop"] is None:
-        p["brand_sure_drop"] = p.get("sure_drop_patterns", [])
+        p["brand_sure_drop"] = []
     if "homonym_noise" not in p or p["homonym_noise"] is None:
         p["homonym_noise"] = []
+    if "search_noise_patterns" not in p or p["search_noise_patterns"] is None:
+        p["search_noise_patterns"] = []
     return p
 
 
@@ -301,7 +305,7 @@ def get_sentiment_model_cached(
     embedder = OpenAIEmbedder(
         client=client, model=openai_embed_model, dimensions=dimensions)
 
-    cfg = SentimentModelConfig(enable_llm_fallback=False)
+    cfg = SentimentModelConfig(enable_llm_fallback=True)
     m = SentimentModel(embed_fn=embedder.embed_texts,
                        config=cfg, openai_api_key=api_key)
     m.load_artifacts(artifacts_npz)
@@ -329,22 +333,12 @@ class StreamlitBrandAnalyticsApp:
         with st.sidebar:
             st.subheader("Settings")
 
-            llm_model = st.text_input(
-                "LLM model", value=st.session_state.get("llm_model", DEFAULT_LLM_MODEL))
-            temperature = st.slider("Temperature", 0.0, 1.0, float(
-                st.session_state.get("temperature", 0.0)), 0.1)
-
-            truncate_chars = st.number_input(
-                "Truncate chars",
-                min_value=100,
-                max_value=5000,
-                value=int(st.session_state.get("truncate_chars", 800)),
-                step=50,
-            )
-
+            llm_model = st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+            temperature = float(st.session_state.get("temperature", 0.0))
+            truncate_chars = int(st.session_state.get("truncate_chars", 800))
             st.session_state["llm_model"] = llm_model
-            st.session_state["temperature"] = float(temperature)
-            st.session_state["truncate_chars"] = int(truncate_chars)
+            st.session_state["temperature"] = temperature
+            st.session_state["truncate_chars"] = truncate_chars
 
             brand_names = ["(manual)"] + sorted(list(self.brands.keys()))
             chosen = st.selectbox("Brand", brand_names, index=int(
@@ -356,25 +350,6 @@ class StreamlitBrandAnalyticsApp:
                 unsafe_allow_html=True,
             )
 
-            st.subheader("File processing")
-            batch_size = st.number_input("Batch size", 1, 50, int(
-                st.session_state.get("batch_size", 6)), 1)
-            max_workers = st.number_input("Max workers", 1, 20, int(
-                st.session_state.get("max_workers", 3)), 1)
-            st.session_state["batch_size"] = int(batch_size)
-            st.session_state["max_workers"] = int(max_workers)
-
-            st.subheader("Embeddings")
-            embed_model = st.text_input(
-                "OpenAI embedding model",
-                value=st.session_state.get("embed_model", DEFAULT_EMBED_MODEL),
-            )
-            embed_batch = st.number_input("Embed batch size", 8, 2048, int(
-                st.session_state.get("embed_batch", 128)), 8)
-
-            st.session_state["embed_model"] = embed_model
-            st.session_state["embed_batch"] = int(embed_batch)
-
             st.subheader("Sentiment")
             enable_sentiment = st.checkbox("Enable sentiment", value=bool(
                 st.session_state.get("enable_sentiment", True)))
@@ -382,15 +357,20 @@ class StreamlitBrandAnalyticsApp:
                 "Sentiment only for KEEP",
                 value=bool(st.session_state.get("sentiment_only_kept", True)),
             )
-            sentiment_artifacts = st.text_input(
-                "Sentiment artifacts (.npz)",
-                value=st.session_state.get(
-                    "sentiment_artifacts", DEFAULT_SENTIMENT_ARTIFACTS),
-            )
-
+            sentiment_artifacts = st.session_state.get(
+                "sentiment_artifacts", DEFAULT_SENTIMENT_ARTIFACTS)
             st.session_state["enable_sentiment"] = bool(enable_sentiment)
             st.session_state["sentiment_only_kept"] = bool(sentiment_only_kept)
             st.session_state["sentiment_artifacts"] = sentiment_artifacts
+
+            batch_size = int(st.session_state.get("batch_size", 6))
+            max_workers = int(st.session_state.get("max_workers", 3))
+            embed_model = st.session_state.get("embed_model", DEFAULT_EMBED_MODEL)
+            embed_batch = int(st.session_state.get("embed_batch", 128))
+            st.session_state["batch_size"] = batch_size
+            st.session_state["max_workers"] = max_workers
+            st.session_state["embed_model"] = embed_model
+            st.session_state["embed_batch"] = embed_batch
 
         return {
             "llm_model": llm_model,
@@ -408,7 +388,10 @@ class StreamlitBrandAnalyticsApp:
 
     # ---------- brand profile ----------
     def brand_profile_editor(self, chosen: str) -> tuple[Dict[str, Any], str]:
-        if chosen != "(manual)" and chosen in self.brands:
+        overrides = st.session_state.get("brand_rule_overrides", {})
+        if chosen != "(manual)" and chosen in overrides:
+            profile = dict(overrides[chosen])
+        elif chosen != "(manual)" and chosen in self.brands:
             profile = dict(self.brands[chosen])
         else:
             profile = {
@@ -419,6 +402,7 @@ class StreamlitBrandAnalyticsApp:
                 "pr_reply_markers": st.session_state.get("manual_pr_reply_markers", []),
                 "brand_sure_drop": st.session_state.get("manual_brand_sure_drop", []),
                 "homonym_noise": st.session_state.get("manual_homonym_noise", []),
+                "search_noise_patterns": st.session_state.get("manual_search_noise_patterns", []),
             }
 
         profile = normalize_profile(profile)
@@ -432,7 +416,7 @@ class StreamlitBrandAnalyticsApp:
             aliases_raw = st.text_input(
                 "Aliases (comma-separated)",
                 value=", ".join(profile.get("aliases") or []),
-                placeholder="familia, фамилия, ...",
+                placeholder="brandname, бренднейм, ...",
             )
 
         description = st.text_area(
@@ -442,45 +426,88 @@ class StreamlitBrandAnalyticsApp:
             placeholder="Что это за бренд, что продаёт/делает, каналы (приложение/сайт), что считаем релевантным…",
         )
 
-        # ВАЖНО: перенос “бренд-паттернов” вниз (ниже) — как ты просил
-        with st.expander("Правила «точно drop» (бренд-специфичные регэкспы)"):
-            sure_drop_text = st.text_area(
-                "По одному паттерну в строке",
-                value="\n".join(profile.get("sure_drop_patterns") or []),
-                height=140,
-                placeholder=r"(?i)\bsagrada\s+familia\b",
-            )
+        extra_brand_patterns = ""
 
-        with st.expander("Бренд-паттерны для предобработки (regex)", expanded=False):
-            extra_brand_patterns = st.text_area(
-                "Каждая строка — отдельный regex. Добавится к brand_name и aliases.",
-                value=st.session_state.get("extra_brand_patterns", ""),
-                height=120,
-                key="extra_brand_patterns",
-                placeholder=r"например:\n(?<!\w)familia(?!\w)\n(?<!\w)фамилия(?!\w)\n",
+        with st.expander("Авто‑генерация правил (AI)", expanded=False):
+            st.caption(
+                "Сгенерирует набор правил по карточке бренда и примерам. "
+                "Проверь результат перед использованием."
             )
+            ex_file = st.file_uploader(
+                "Примеры (CSV/XLSX, колонка 'Текст') — опционально",
+                type=["csv", "xlsx", "xls"],
+                key="rules_ex_file",
+            )
+            ex_limit = st.number_input(
+                "Макс. примеров",
+                min_value=5,
+                max_value=100,
+                value=30,
+                step=5,
+                key="rules_ex_limit",
+            )
+            gen_btn = st.button("Сгенерировать правила", key="gen_rules_btn")
 
-        with st.expander("Маркеры PR/официальных ответов (регэкспы)"):
-            pr_text = st.text_area(
-                "По одному паттерну в строке",
-                value="\n".join(profile.get("pr_reply_markers") or []),
-                height=120,
-                placeholder=r"(?i)^здравствуйте",
-            )
+            if gen_btn:
+                if not self.api_key_present:
+                    st.error("Нет OPENAI_API_KEY — добавь ключ в Secrets.")
+                else:
+                    examples: List[str] = []
+                    if ex_file is not None:
+                        try:
+                            df_ex = read_uploaded_table(ex_file)
+                            if "Текст" in df_ex.columns:
+                                texts = df_ex["Текст"].astype(str).fillna("").tolist()
+                            else:
+                                texts = df_ex.iloc[:, 0].astype(str).fillna("").tolist()
+                            for t in texts[: int(ex_limit)]:
+                                t = t.strip()
+                                if t:
+                                    examples.append(t[:400])
+                        except Exception as e:
+                            st.warning("Не удалось прочитать примеры.")
+                            st.exception(e)
+
+                    client = get_client(self.api_key or "")
+                    try:
+                        parsed = generate_rules(
+                            profile,
+                            examples,
+                            client=client,
+                            model=st.session_state.get("llm_model", DEFAULT_LLM_MODEL),
+                            temperature=0.2,
+                        )
+                        profile["sure_drop_patterns"] = parsed.sure_drop_patterns
+                        profile["brand_sure_drop"] = parsed.brand_sure_drop
+                        profile["homonym_noise"] = parsed.homonym_noise
+                        profile["search_noise_patterns"] = parsed.search_noise_patterns
+                        profile["pr_reply_markers"] = parsed.pr_reply_markers
+
+                        # persist for session
+                        overrides = dict(st.session_state.get("brand_rule_overrides", {}))
+                        if chosen != "(manual)":
+                            overrides[chosen] = dict(profile)
+                            st.session_state["brand_rule_overrides"] = overrides
+                        else:
+                            st.session_state["manual_sure_drop_patterns"] = profile["sure_drop_patterns"]
+                            st.session_state["manual_brand_sure_drop"] = profile["brand_sure_drop"]
+                            st.session_state["manual_homonym_noise"] = profile["homonym_noise"]
+                            st.session_state["manual_search_noise_patterns"] = profile["search_noise_patterns"]
+                            st.session_state["manual_pr_reply_markers"] = profile["pr_reply_markers"]
+
+                        st.success("Правила обновлены в этой сессии.")
+                        st.json(parsed.model_dump())
+                    except Exception as e:
+                        st.error("Не удалось сгенерировать правила.")
+                        st.exception(e)
 
         profile["brand_name"] = brand_name.strip(
         ) if brand_name.strip() else "BRAND"
         profile["aliases"] = [a.strip()
                               for a in aliases_raw.split(",") if a.strip()]
         profile["description"] = description.strip()
-        profile["sure_drop_patterns"] = [line.strip()
-                                         for line in sure_drop_text.splitlines() if line.strip()]
-        profile["pr_reply_markers"] = [line.strip()
-                                       for line in pr_text.splitlines() if line.strip()]
-
-        # для сервис-класса: прокинем совместимые ключи
-        profile["brand_sure_drop"] = profile["sure_drop_patterns"]
         profile.setdefault("homonym_noise", [])
+        profile.setdefault("search_noise_patterns", [])
 
         if chosen == "(manual)":
             st.session_state["manual_brand_name"] = profile["brand_name"]
@@ -491,6 +518,8 @@ class StreamlitBrandAnalyticsApp:
             st.session_state["manual_brand_sure_drop"] = profile["brand_sure_drop"]
             st.session_state["manual_homonym_noise"] = profile.get(
                 "homonym_noise", [])
+            st.session_state["manual_search_noise_patterns"] = profile.get(
+                "search_noise_patterns", [])
 
         return profile, extra_brand_patterns
 

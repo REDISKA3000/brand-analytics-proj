@@ -60,6 +60,21 @@ Topic/aspect tagging for comments:
 
 ---
 
+## Brand rules are per‑brand, not hardcoded
+
+All “sure drop” logic is driven by the brand profile in `brands.yaml` (or manual input in the UI).  
+The code is brand‑agnostic and supports separate buckets:
+
+- `sure_drop_patterns` — вакансии/найм
+- `brand_sure_drop` — локация/ориентир (косвенное упоминание)
+- `homonym_noise` — омонимы / другие бизнесы
+- `pr_reply_markers` — официальные ответы
+- `search_noise_patterns` — поисковый/SEO шум
+
+For a new brand, copy `brands_template.yaml` and fill in your patterns.
+
+---
+
 ## Quick start (local)
 
 ### 1) Install

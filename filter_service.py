@@ -35,18 +35,19 @@ class RuleEngine:
     Правила "точно drop" до LLM.
     Ожидается, что profile содержит списки паттернов (как у тебя сейчас в brands.yaml):
       - sure_drop_patterns (например найм, вакансии)
-      - brand_sure_drop (например 'рядом с ...')
+      - brand_sure_drop (например 'рядом с ...' как ориентир)
       - pr_reply_markers (официальные ответы)
       - homonym_noise (омонимы и шум)
+      - search_noise_patterns (поисковый/SEO шум не про магазин)
     """
 
     def sure_drop(self, text: str, profile: Dict[str, Any]) -> Optional[Dict[str, str]]:
         if not text:
             return None
 
-        hiring = _match_any(profile.get("sure_drop_patterns", []), text)
-        if hiring:
-            return {"rule_code": "hiring", "pattern": hiring}
+        vacancy = _match_any(profile.get("sure_drop_patterns", []), text)
+        if vacancy:
+            return {"rule_code": "vacancy", "pattern": vacancy}
 
         near_brand = _match_any(profile.get("brand_sure_drop", []), text)
         if near_brand:
@@ -59,6 +60,10 @@ class RuleEngine:
         homonym = _match_any(profile.get("homonym_noise", []), text)
         if homonym:
             return {"rule_code": "homonym_noise", "pattern": homonym}
+
+        search_noise = _match_any(profile.get("search_noise_patterns", []), text)
+        if search_noise:
+            return {"rule_code": "search_noise", "pattern": search_noise}
 
         return None
 

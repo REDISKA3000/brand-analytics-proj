@@ -272,7 +272,11 @@ class SentimentModel:
                 payload = [(i, texts[i]) for i in need]
                 llm_map = self.llm_fallback_parallel(payload)
                 for i in need:
-                    labels[i] = llm_map[i]  # must exist
+                    # LLM may return partial results; keep prototype label if missing
+                    if i in llm_map:
+                        labels[i] = llm_map[i]
+                    else:
+                        source[i] = "llm_fail"
 
         if not return_df:
             return labels, source, sim_pred, scores
