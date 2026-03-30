@@ -22,6 +22,7 @@ class CategoryTaggingService:
         df_in: pd.DataFrame,
         text_col: str,
         user_prompt: str,
+        allowed_categories: Optional[List[str]] = None,
         preprocess_fn,
         ref_index: Optional[CategoryIndex] = None,
         is_drop_col: Optional[str] = "is_drop",
@@ -67,11 +68,12 @@ class CategoryTaggingService:
 
         # neighbors for RAG
         neighbors_all = None
-        allowed_categories = None
+        allowed_categories_final = list(allowed_categories or [])
         use_rag = ref_index is not None
 
         if use_rag:
-            allowed_categories = ref_index.categories
+            if not allowed_categories_final:
+                allowed_categories_final = ref_index.categories
             texts_for_neighbors = [t for _, t in items_all]
             neighbors_all = self.tagger.retrieve_neighbors(
                 texts=texts_for_neighbors,
@@ -97,7 +99,7 @@ class CategoryTaggingService:
             out_map = self.tagger.classify_batch_llm(
                 items=batch_items,
                 user_prompt=user_prompt,
-                allowed_categories=allowed_categories,
+                allowed_categories=allowed_categories_final,
                 neighbors_list=batch_neighbors,
             )
             return out_map

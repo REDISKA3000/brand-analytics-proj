@@ -119,9 +119,15 @@ BASE_SYSTEM_TEMPLATE = """
 Синонимы/алиасы (как пользователи могут писать бренд):
 {brand_aliases}
 
+Категории, которые обычно считаются KEEP:
+{brand_keep_categories}
+
+Категории, которые обычно считаются DROP:
+{brand_drop_categories}
+
 Задача: для каждого сообщения выбрать только одно:
-- "keep" — если сообщение относится к бренду/магазину/сети/приложению/бонусам/покупкам/ассортименту/скидкам/сервису.
-- "drop" — если это явно НЕ про бренд как магазин/приложение/сервис.
+- "keep" — если сообщение относится к бренду и попадает в keep-категории или в близкий к ним пользовательский сценарий.
+- "drop" — если сообщение явно не относится к бренду или попадает в drop-категории.
 
 ПРАВИЛО ПО УМОЛЧАНИЮ: если есть сомнения — выбирай "keep".
 
@@ -146,6 +152,8 @@ def load_brands(path: str = "brands.yaml") -> Dict[str, Dict[str, Any]]:
         p.setdefault("brand_name", k)
         p.setdefault("description", "")
         p.setdefault("aliases", [])
+        p.setdefault("keep_categories", [])
+        p.setdefault("drop_categories", [])
         p.setdefault("sure_drop_patterns", [])
         p.setdefault("pr_reply_markers", [])
         # совместимость с RuleEngine из filter_service.py
@@ -161,6 +169,8 @@ def normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     p.setdefault("brand_name", "BRAND")
     p.setdefault("description", "")
     p.setdefault("aliases", [])
+    p.setdefault("keep_categories", [])
+    p.setdefault("drop_categories", [])
     p.setdefault("sure_drop_patterns", [])
     p.setdefault("pr_reply_markers", [])
     if "brand_sure_drop" not in p or p["brand_sure_drop"] is None:
@@ -169,7 +179,42 @@ def normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
         p["homonym_noise"] = []
     if "search_noise_patterns" not in p or p["search_noise_patterns"] is None:
         p["search_noise_patterns"] = []
+    def _normalize_named_categories(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out_items = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get("name") or item.get("category_name") or "").strip()
+            if not name:
+                continue
+            description = (item.get("description") or "").strip()
+            patterns = [str(x).strip() for x in (item.get("patterns") or []) if str(x).strip()]
+            out_items.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "patterns": patterns,
+                }
+            )
+        return out_items
+
+    p["keep_categories"] = _normalize_named_categories(p.get("keep_categories", []))
+    p["drop_categories"] = _normalize_named_categories(p.get("drop_categories", []))
     return p
+
+
+def _format_named_categories(categories: List[Dict[str, Any]]) -> str:
+    lines = []
+    for item in categories or []:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        description = (item.get("description") or "").strip()
+        if description:
+            lines.append(f"- {name}: {description}")
+        else:
+            lines.append(f"- {name}")
+    return "\n".join(lines) or "—"
 
 
 def format_system_prompt(base_template: str, profile: Dict[str, Any]) -> str:
@@ -178,11 +223,86 @@ def format_system_prompt(base_template: str, profile: Dict[str, Any]) -> str:
     aliases = profile.get("aliases") or []
     aliases_str = ", ".join([a.strip()
                             for a in aliases if str(a).strip()]) or "—"
+    keep_categories_str = _format_named_categories(profile.get("keep_categories", []))
+    drop_categories_str = _format_named_categories(profile.get("drop_categories", []))
     return base_template.format(
         brand_name=brand_name,
         brand_description=desc if desc else "—",
         brand_aliases=aliases_str,
+        brand_keep_categories=keep_categories_str,
+        brand_drop_categories=drop_categories_str,
     ).strip()
+
+
+def format_named_categories_text(categories: List[Dict[str, Any]]) -> str:
+    lines = []
+    for item in categories or []:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or item.get("category_name") or "").strip()
+        if not name:
+            continue
+        description = (item.get("description") or "").strip()
+        if description:
+            lines.append(f"{name} - {description}")
+        else:
+            lines.append(name)
+    return "\n".join(lines)
+
+
+def parse_named_categories_text(raw_text: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for raw_line in (raw_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = re.split(r"\s+[—-]\s+|:\s*", line, maxsplit=1)
+        name = (parts[0] or "").strip()
+        description = (parts[1] if len(parts) > 1 else "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append({"name": name, "description": description, "patterns": []})
+    return out
+
+
+def build_category_prompt(profile: Dict[str, Any]) -> str:
+    brand_name = (profile.get("brand_name") or "BRAND").strip()
+    brand_context = (profile.get("description") or "").strip()
+    keep_categories = profile.get("keep_categories", []) or []
+
+    lines = [
+        f'Ты классифицируешь комментарии пользователей о бренде "{brand_name}".',
+        "",
+        "Выбирай строго одну категорию из списка ниже.",
+        "",
+        "Категории:",
+    ]
+
+    for item in keep_categories:
+        name = (item.get("name") or "").strip()
+        if not name:
+            continue
+        description = (item.get("description") or "").strip()
+        if description:
+            lines.append(f"- {name}: {description}")
+        else:
+            lines.append(f"- {name}")
+
+    lines.extend(
+        [
+            "",
+            f"Контекст бренда: {brand_context if brand_context else '—'}",
+            "",
+            "Правила:",
+            "- Выбирай одну главную категорию по основной мысли комментария.",
+            "- Не придумывай новые категории.",
+            "- Используй только категории из списка.",
+            '- Если комментарий касается нескольких тем, выбирай наиболее важную для пользователя тему.',
+        ]
+    )
+    return "\n".join(lines).strip()
 
 
 # ---------------- Helpers: OpenAI ----------------
@@ -311,16 +431,6 @@ def get_sentiment_model_cached(
     m.load_artifacts(artifacts_npz)
     return m
 
-
-def sentiment_badge(label: str) -> str:
-    l = (label or "").strip().lower()
-    if l == "positive":
-        return '<span class="badge badge--green">SENTIMENT: POSITIVE</span>'
-    if l == "negative":
-        return '<span class="badge badge--red">SENTIMENT: NEGATIVE</span>'
-    return '<span class="badge badge--gray">SENTIMENT: NEUTRAL</span>'
-
-
 # ---------------- App (class-based) ----------------
 class StreamlitBrandAnalyticsApp:
     def __init__(self):
@@ -398,6 +508,8 @@ class StreamlitBrandAnalyticsApp:
                 "brand_name": st.session_state.get("manual_brand_name", "BRAND"),
                 "description": st.session_state.get("manual_description", ""),
                 "aliases": st.session_state.get("manual_aliases", []),
+                "keep_categories": st.session_state.get("manual_keep_categories", []),
+                "drop_categories": st.session_state.get("manual_drop_categories", []),
                 "sure_drop_patterns": st.session_state.get("manual_sure_drop_patterns", []),
                 "pr_reply_markers": st.session_state.get("manual_pr_reply_markers", []),
                 "brand_sure_drop": st.session_state.get("manual_brand_sure_drop", []),
@@ -426,15 +538,39 @@ class StreamlitBrandAnalyticsApp:
             placeholder="Что это за бренд, что продаёт/делает, каналы (приложение/сайт), что считаем релевантным…",
         )
 
+        keep_categories_raw = st.text_area(
+            "Keep categories (one per line: Название - описание)",
+            value=format_named_categories_text(profile.get("keep_categories", [])),
+            height=160,
+            placeholder="Покупка и ассортимент - Комментарии про товары, наличие, размеры, выбор\nПриложение и бонусы - Комментарии про приложение, сайт, оплату, бонусы",
+        )
+
+        drop_categories_raw = st.text_area(
+            "Drop categories (one per line: Название - описание)",
+            value=format_named_categories_text(profile.get("drop_categories", [])),
+            height=160,
+            placeholder="Вакансии и найм - Сообщения про вакансии, поиск сотрудников, HR\nЛокация и ориентир - Бренд упомянут только как гео-точка",
+        )
+
+        updated_profile = normalize_profile(
+            {
+                **profile,
+                "brand_name": brand_name.strip() if brand_name.strip() else "BRAND",
+                "aliases": [a.strip() for a in aliases_raw.split(",") if a.strip()],
+                "description": description.strip(),
+                "keep_categories": parse_named_categories_text(keep_categories_raw),
+                "drop_categories": parse_named_categories_text(drop_categories_raw),
+            }
+        )
+
         extra_brand_patterns = ""
 
         with st.expander("Авто‑генерация правил (AI)", expanded=False):
             st.caption(
-                "Сгенерирует набор правил по карточке бренда и примерам. "
-                "Проверь результат перед использованием."
+                "Сгенерирует regex по пользовательским drop-категориям и размеченным примерам."
             )
             ex_file = st.file_uploader(
-                "Примеры (CSV/XLSX, колонка 'Текст') — опционально",
+                "Примеры (CSV/XLSX, колонки 'Текст' и 'Категория') — опционально",
                 type=["csv", "xlsx", "xls"],
                 key="rules_ex_file",
             )
@@ -451,68 +587,90 @@ class StreamlitBrandAnalyticsApp:
             if gen_btn:
                 if not self.api_key_present:
                     st.error("Нет OPENAI_API_KEY — добавь ключ в Secrets.")
+                elif not updated_profile.get("drop_categories"):
+                    st.error("Сначала задай хотя бы одну drop-категорию.")
                 else:
-                    examples: List[str] = []
+                    examples: List[Dict[str, str]] = []
+                    examples_invalid = False
                     if ex_file is not None:
                         try:
                             df_ex = read_uploaded_table(ex_file)
-                            if "Текст" in df_ex.columns:
-                                texts = df_ex["Текст"].astype(str).fillna("").tolist()
-                            else:
-                                texts = df_ex.iloc[:, 0].astype(str).fillna("").tolist()
-                            for t in texts[: int(ex_limit)]:
-                                t = t.strip()
-                                if t:
-                                    examples.append(t[:400])
+                            if "Текст" not in df_ex.columns or "Категория" not in df_ex.columns:
+                                st.error("Файл примеров должен содержать колонки 'Текст' и 'Категория'.")
+                                examples_invalid = True
+                                df_ex = None
+                            if df_ex is not None:
+                                allowed = {item["name"] for item in updated_profile.get("drop_categories", [])}
+                                subset = df_ex[["Текст", "Категория"]].copy()
+                                subset["Текст"] = subset["Текст"].astype(str).fillna("").str.strip()
+                                subset["Категория"] = subset["Категория"].astype(str).fillna("").str.strip()
+                                subset = subset[(subset["Текст"] != "") & (subset["Категория"] != "")]
+                                unknown = sorted({x for x in subset["Категория"].tolist() if x not in allowed})
+                                if unknown:
+                                    st.error(
+                                        "В файле примеров есть категории, которых нет в списке drop-категорий: "
+                                        + ", ".join(unknown)
+                                    )
+                                    examples_invalid = True
+                                    subset = subset.iloc[0:0]
+                                for _, row in subset.head(int(ex_limit)).iterrows():
+                                    examples.append(
+                                        {
+                                            "text": str(row["Текст"])[:400],
+                                            "category": str(row["Категория"]),
+                                        }
+                                    )
                         except Exception as e:
                             st.warning("Не удалось прочитать примеры.")
                             st.exception(e)
+                            examples_invalid = True
 
-                    client = get_client(self.api_key or "")
-                    try:
-                        parsed = generate_rules(
-                            profile,
-                            examples,
-                            client=client,
-                            model=st.session_state.get("llm_model", DEFAULT_LLM_MODEL),
-                            temperature=0.2,
-                        )
-                        profile["sure_drop_patterns"] = parsed.sure_drop_patterns
-                        profile["brand_sure_drop"] = parsed.brand_sure_drop
-                        profile["homonym_noise"] = parsed.homonym_noise
-                        profile["search_noise_patterns"] = parsed.search_noise_patterns
-                        profile["pr_reply_markers"] = parsed.pr_reply_markers
+                    if not examples_invalid:
+                        client = get_client(self.api_key or "")
+                        try:
+                            parsed = generate_rules(
+                                updated_profile,
+                                updated_profile.get("drop_categories", []),
+                                examples,
+                                client=client,
+                                model=st.session_state.get("llm_model", DEFAULT_LLM_MODEL),
+                                temperature=0.2,
+                            )
+                            patterns_by_name = {
+                                item.category_name: item.patterns for item in parsed.rules
+                            }
+                            updated_profile["drop_categories"] = [
+                                {
+                                    "name": item["name"],
+                                    "description": item.get("description", ""),
+                                    "patterns": patterns_by_name.get(item["name"], []),
+                                }
+                                for item in updated_profile.get("drop_categories", [])
+                            ]
 
-                        # persist for session
-                        overrides = dict(st.session_state.get("brand_rule_overrides", {}))
-                        if chosen != "(manual)":
-                            overrides[chosen] = dict(profile)
-                            st.session_state["brand_rule_overrides"] = overrides
-                        else:
-                            st.session_state["manual_sure_drop_patterns"] = profile["sure_drop_patterns"]
-                            st.session_state["manual_brand_sure_drop"] = profile["brand_sure_drop"]
-                            st.session_state["manual_homonym_noise"] = profile["homonym_noise"]
-                            st.session_state["manual_search_noise_patterns"] = profile["search_noise_patterns"]
-                            st.session_state["manual_pr_reply_markers"] = profile["pr_reply_markers"]
+                            # persist for session
+                            overrides = dict(st.session_state.get("brand_rule_overrides", {}))
+                            if chosen != "(manual)":
+                                overrides[chosen] = dict(updated_profile)
+                                st.session_state["brand_rule_overrides"] = overrides
+                            else:
+                                st.session_state["manual_drop_categories"] = updated_profile["drop_categories"]
 
-                        st.success("Правила обновлены в этой сессии.")
-                        st.json(parsed.model_dump())
-                    except Exception as e:
-                        st.error("Не удалось сгенерировать правила.")
-                        st.exception(e)
+                            st.success(
+                                f"Правила сгенерированы для {len(updated_profile['drop_categories'])} категорий."
+                            )
+                        except Exception as e:
+                            st.error("Не удалось сгенерировать правила.")
+                            st.exception(e)
 
-        profile["brand_name"] = brand_name.strip(
-        ) if brand_name.strip() else "BRAND"
-        profile["aliases"] = [a.strip()
-                              for a in aliases_raw.split(",") if a.strip()]
-        profile["description"] = description.strip()
-        profile.setdefault("homonym_noise", [])
-        profile.setdefault("search_noise_patterns", [])
+        profile = updated_profile
 
         if chosen == "(manual)":
             st.session_state["manual_brand_name"] = profile["brand_name"]
             st.session_state["manual_aliases"] = profile["aliases"]
             st.session_state["manual_description"] = profile["description"]
+            st.session_state["manual_keep_categories"] = profile["keep_categories"]
+            st.session_state["manual_drop_categories"] = profile["drop_categories"]
             st.session_state["manual_sure_drop_patterns"] = profile["sure_drop_patterns"]
             st.session_state["manual_pr_reply_markers"] = profile["pr_reply_markers"]
             st.session_state["manual_brand_sure_drop"] = profile["brand_sure_drop"]
@@ -525,23 +683,7 @@ class StreamlitBrandAnalyticsApp:
 
     # ---------- system prompt ----------
     def system_prompt_section(self, profile: Dict[str, Any]) -> str:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("System prompt template")
-
-        base_template = st.text_area(
-            "Template (editable)",
-            value=st.session_state.get("base_template", BASE_SYSTEM_TEMPLATE),
-            height=220,
-        )
-        st.session_state["base_template"] = base_template
-
-        final_system = format_system_prompt(base_template, profile)
-
-        with st.expander("Preview: final system prompt"):
-            st.code(final_system, language="text")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-        return final_system
+        return format_system_prompt(BASE_SYSTEM_TEMPLATE, profile)
 
     # ---------- readiness ----------
     def ensure_ready(self):
@@ -591,138 +733,6 @@ class StreamlitBrandAnalyticsApp:
             return preproc_factory.preprocess_for_llm(t, pre)
 
         return SentimentService(model=model, preprocess_fn=preprocess_fn, embed_batch_size=int(embed_batch_size))
-
-    # ---------- render: single ----------
-    def render_single(
-        self,
-        *,
-        profile: Dict[str, Any],
-        final_system: str,
-        extra_brand_patterns: str,
-        model: str,
-        temperature: float,
-        truncate_chars: int,
-        enable_sentiment: bool,
-        sentiment_only_kept: bool,
-        sentiment_artifacts: str,
-        embed_model: str,
-        embed_batch: int,
-    ):
-        st.subheader("Single comment")
-
-        single_text = st.text_area(
-            "Paste comment text",
-            height=180,
-            placeholder="One comment here…",
-            key="single_text",
-        )
-
-        run_one = st.button("🚀 Run", type="primary",
-                            use_container_width=True, key="run_one_btn")
-
-        if not run_one:
-            return
-
-        if not self.api_key_present:
-            st.error("Нет OPENAI_API_KEY — добавь ключ в Secrets.")
-            st.stop()
-
-        preproc_factory = PreprocessorFactory(max_words=250)
-        pre = preproc_factory.make(profile, extra_brand_patterns)
-
-        def preprocess_fn(text_rule: str) -> str:
-            return preproc_factory.preprocess_for_llm(text_rule, pre)
-
-        client = get_client(self.api_key or "")
-        llm = OpenAIRelevanceBatchModel(client=client, default_model=model)
-        service = RelevanceFilterService(llm=llm)
-
-        # ---- relevance ----
-        with st.spinner("Relevance…"):
-            t0 = time.perf_counter()
-            res = service.classify_one(
-                raw_text=single_text,
-                profile=profile,
-                system_prompt=final_system,
-                preprocess_fn=preprocess_fn,
-                truncate_chars=truncate_chars,
-                model=model,
-                temperature=temperature,
-            )
-            dt_total = time.perf_counter() - t0
-
-        action = res.get("action", "keep")
-        is_drop = action == "drop"
-        source = res.get("source", "llm")
-
-        # ---- sentiment (optional) ----
-        sent_label = None
-        sent_meta = None
-
-        if enable_sentiment:
-            if sentiment_only_kept and is_drop:
-                sent_label = None
-                sent_meta = {"skipped": True, "reason": "is_drop=Yes"}
-            else:
-                sent_service = self._build_sentiment_service(
-                    preproc_factory=preproc_factory,
-                    pre=pre,
-                    artifacts_npz=sentiment_artifacts,
-                    openai_embed_model=embed_model,
-                    embed_batch_size=embed_batch,
-                )
-                if sent_service is None:
-                    sent_meta = {"skipped": True,
-                                 "reason": "sentiment assets not found"}
-                else:
-                    with st.spinner("Sentiment…"):
-                        sres = sent_service.predict_one(single_text)
-                    sent_label = sres.get("label")
-                    sent_meta = sres
-
-        # ---- UI ----
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.header("Result")
-
-        badges: List[str] = []
-        if is_drop:
-            badges.append(
-                '<span class="badge badge--red">RELEVANCE: DROP</span>')
-        else:
-            badges.append(
-                '<span class="badge badge--green">RELEVANCE: KEEP</span>')
-
-        if source == "rule":
-            badges.append(
-                '<span class="badge badge--blue">SOURCE: RULE</span>')
-        else:
-            badges.append('<span class="badge badge--blue">SOURCE: LLM</span>')
-
-        if enable_sentiment:
-            if sent_meta and sent_meta.get("skipped"):
-                badges.append(
-                    '<span class="badge badge--gray">SENTIMENT: SKIPPED</span>')
-            elif sent_label:
-                badges.append(sentiment_badge(sent_label))
-
-        st.markdown(
-            f'<div class="badge-row">{"".join(badges)}</div>', unsafe_allow_html=True)
-
-        if source == "rule":
-            st.caption(
-                f"Pre-LLM rule: {res.get('rule', {}).get('rule_code', 'rule')}")
-        else:
-            st.caption(
-                f"Latency: {res.get('latency_s', 0.0):.3f}s • total: {dt_total:.3f}s")
-
-        with st.expander("Details (JSON)"):
-            payload = {"relevance": {"results": [
-                {"global_idx": 0, "action": action}]}}
-            if enable_sentiment:
-                payload["sentiment"] = sent_meta
-            st.json(payload)
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
     # ---------- render: file (relevance + sentiment) ----------
     def render_file(
@@ -941,24 +951,6 @@ class StreamlitBrandAnalyticsApp:
             key="cat_ref_file",
         )
 
-        user_prompt = st.text_area(
-            "Category definitions prompt (required)",
-            height=220,
-            placeholder="Define categories, decision rules, edge cases, what to do if unclear…",
-            key="cat_user_prompt",
-        )
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            top_k = st.number_input(
-                "top_k (RAG)", min_value=1, max_value=20, value=5, step=1)
-        with col2:
-            llm_batch_size = st.number_input(
-                "LLM batch size", min_value=1, max_value=30, value=int(batch_size), step=1)
-        with col3:
-            mw = st.number_input("max_workers", min_value=1,
-                                 max_value=12, value=int(max_workers), step=1)
-
         run_btn = st.button("🚀 Tag categories", type="primary",
                             use_container_width=True, key="run_cat_btn")
 
@@ -977,10 +969,13 @@ class StreamlitBrandAnalyticsApp:
             st.error("Input must contain column 'Текст'.")
             st.stop()
 
-        if not user_prompt.strip():
-            st.error(
-                "Category prompt is required. Please write definitions and rules.")
+        allowed_categories = [
+            item["name"] for item in (profile.get("keep_categories") or []) if (item.get("name") or "").strip()
+        ]
+        if not allowed_categories:
+            st.error("Сначала задай хотя бы одну keep-категорию в карточке бренда.")
             st.stop()
+        user_prompt = build_category_prompt(profile)
 
         preproc_factory = PreprocessorFactory(max_words=250)
         pre = preproc_factory.make(profile, extra_brand_patterns)
@@ -1019,11 +1014,18 @@ class StreamlitBrandAnalyticsApp:
                         st.error(
                             "Labeled dataset must contain columns 'Текст' and 'Категория'.")
                         st.stop()
+                    ref_categories = df_ref["Категория"].astype(str).fillna("").str.strip()
+                    unknown_cats = sorted({x for x in ref_categories.tolist() if x and x not in allowed_categories})
+                    if unknown_cats:
+                        st.error(
+                            "Labeled dataset contains categories outside Keep categories: "
+                            + ", ".join(unknown_cats)
+                        )
+                        st.stop()
 
                     ref_texts = [preprocess_fn(x) for x in df_ref["Текст"].astype(
                         str).fillna("").tolist()]
-                    ref_cats = df_ref["Категория"].astype(
-                        str).fillna("").tolist()
+                    ref_cats = ref_categories.tolist()
 
                     with st.spinner("Building embedding index for labeled dataset…"):
                         ref_index = tagger.build_index(
@@ -1046,12 +1048,13 @@ class StreamlitBrandAnalyticsApp:
                 df_in=df_in,
                 text_col="Текст",
                 user_prompt=user_prompt,
+                allowed_categories=allowed_categories,
                 preprocess_fn=preprocess_fn,
                 ref_index=ref_index,
                 is_drop_col="is_drop" if "is_drop" in df_in.columns else None,
-                top_k=int(top_k),
-                llm_batch_size=int(llm_batch_size),
-                max_workers=int(mw),
+                top_k=5,
+                llm_batch_size=int(batch_size),
+                max_workers=int(max_workers),
                 truncate_chars=int(truncate_chars),
                 embed_batch_size=int(embed_batch),
             )
@@ -1102,39 +1105,21 @@ class StreamlitBrandAnalyticsApp:
         )
 
         if tool == "Relevance + Sentiment":
-            mode = st.radio("Mode", ["Single comment",
-                            "File (CSV/XLSX)"], horizontal=True)
-
-            if mode == "File (CSV/XLSX)":
-                self.render_file(
-                    profile=profile,
-                    final_system=final_system,
-                    extra_brand_patterns=extra_brand_patterns,
-                    model=settings["llm_model"],
-                    temperature=settings["temperature"],
-                    truncate_chars=settings["truncate_chars"],
-                    batch_size=settings["batch_size"],
-                    max_workers=settings["max_workers"],
-                    enable_sentiment=settings["enable_sentiment"],
-                    sentiment_only_kept=settings["sentiment_only_kept"],
-                    sentiment_artifacts=settings["sentiment_artifacts"],
-                    embed_model=settings["embed_model"],
-                    embed_batch=settings["embed_batch"],
-                )
-            else:
-                self.render_single(
-                    profile=profile,
-                    final_system=final_system,
-                    extra_brand_patterns=extra_brand_patterns,
-                    model=settings["llm_model"],
-                    temperature=settings["temperature"],
-                    truncate_chars=settings["truncate_chars"],
-                    enable_sentiment=settings["enable_sentiment"],
-                    sentiment_only_kept=settings["sentiment_only_kept"],
-                    sentiment_artifacts=settings["sentiment_artifacts"],
-                    embed_model=settings["embed_model"],
-                    embed_batch=settings["embed_batch"],
-                )
+            self.render_file(
+                profile=profile,
+                final_system=final_system,
+                extra_brand_patterns=extra_brand_patterns,
+                model=settings["llm_model"],
+                temperature=settings["temperature"],
+                truncate_chars=settings["truncate_chars"],
+                batch_size=settings["batch_size"],
+                max_workers=settings["max_workers"],
+                enable_sentiment=settings["enable_sentiment"],
+                sentiment_only_kept=settings["sentiment_only_kept"],
+                sentiment_artifacts=settings["sentiment_artifacts"],
+                embed_model=settings["embed_model"],
+                embed_batch=settings["embed_batch"],
+            )
 
         else:
             self.render_categories_file(

@@ -33,37 +33,65 @@ def _match_any(patterns: List[str], text: str) -> Optional[str]:
 class RuleEngine:
     """
     Правила "точно drop" до LLM.
-    Ожидается, что profile содержит списки паттернов (как у тебя сейчас в brands.yaml):
-      - sure_drop_patterns (например найм, вакансии)
-      - brand_sure_drop (например 'рядом с ...' как ориентир)
-      - pr_reply_markers (официальные ответы)
-      - homonym_noise (омонимы и шум)
-      - search_noise_patterns (поисковый/SEO шум не про магазин)
+    Предпочтительный формат profile:
+      - drop_categories: [{name, description, patterns}, ...]
+
+    Для совместимости поддерживается и старый формат brands.yaml:
+      - sure_drop_patterns
+      - brand_sure_drop
+      - pr_reply_markers
+      - homonym_noise
+      - search_noise_patterns
     """
+
+    @staticmethod
+    def _profile_categories(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+        categories = []
+        for item in profile.get("drop_categories", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = (item.get("name") or item.get("category_name") or "").strip()
+            description = (item.get("description") or "").strip()
+            patterns = [str(p).strip() for p in (item.get("patterns") or []) if str(p).strip()]
+            if not name:
+                continue
+            categories.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "patterns": patterns,
+                }
+            )
+
+        if any(item.get("patterns") for item in categories):
+            return categories
+
+        legacy_map = [
+            ("sure_drop_patterns", "Вакансии и найм"),
+            ("brand_sure_drop", "Локация и ориентир"),
+            ("pr_reply_markers", "Официальный ответ"),
+            ("homonym_noise", "Омонимы и другие бизнесы"),
+            ("search_noise_patterns", "Поисковый и SEO шум"),
+        ]
+        for key, name in legacy_map:
+            patterns = [str(p).strip() for p in (profile.get(key) or []) if str(p).strip()]
+            if not patterns:
+                continue
+            categories.append({"name": name, "description": "", "patterns": patterns})
+        return categories
 
     def sure_drop(self, text: str, profile: Dict[str, Any]) -> Optional[Dict[str, str]]:
         if not text:
             return None
 
-        vacancy = _match_any(profile.get("sure_drop_patterns", []), text)
-        if vacancy:
-            return {"rule_code": "vacancy", "pattern": vacancy}
-
-        near_brand = _match_any(profile.get("brand_sure_drop", []), text)
-        if near_brand:
-            return {"rule_code": "near_brand", "pattern": near_brand}
-
-        pr = _match_any(profile.get("pr_reply_markers", []), text)
-        if pr:
-            return {"rule_code": "pr_reply", "pattern": pr}
-
-        homonym = _match_any(profile.get("homonym_noise", []), text)
-        if homonym:
-            return {"rule_code": "homonym_noise", "pattern": homonym}
-
-        search_noise = _match_any(profile.get("search_noise_patterns", []), text)
-        if search_noise:
-            return {"rule_code": "search_noise", "pattern": search_noise}
+        for category in self._profile_categories(profile):
+            hit = _match_any(category.get("patterns", []), text)
+            if hit:
+                return {
+                    "rule_code": category["name"],
+                    "category_name": category["name"],
+                    "pattern": hit,
+                }
 
         return None
 

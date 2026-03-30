@@ -3,6 +3,8 @@ https://brand-analytics-proj-d9enuniaul4vemjntbhqnv.streamlit.app
 
 A project for end-to-end brand opinion analytics from user comments — turning raw UGC into clean, actionable signals for product and marketing.
 
+Architecture overview: see `ARCHITECTURE.md`.
+
 This repository already includes the first module: a **relevance filter** (what’s actually about the brand vs. noise).  
 Next in the roadmap: **sentiment analysis** and **semantic tagging**.
 
@@ -63,13 +65,11 @@ Topic/aspect tagging for comments:
 ## Brand rules are per‑brand, not hardcoded
 
 All “sure drop” logic is driven by the brand profile in `brands.yaml` (or manual input in the UI).  
-The code is brand‑agnostic and supports separate buckets:
+The code is brand‑agnostic and supports user-defined `drop_categories`, where each category has:
 
-- `sure_drop_patterns` — вакансии/найм
-- `brand_sure_drop` — локация/ориентир (косвенное упоминание)
-- `homonym_noise` — омонимы / другие бизнесы
-- `pr_reply_markers` — официальные ответы
-- `search_noise_patterns` — поисковый/SEO шум
+- `name` — пользовательское название категории
+- `description` — описание того, что нужно выбрасывать
+- `patterns` — сгенерированные или заданные regex
 
 For a new brand, copy `brands_template.yaml` and fill in your patterns.
 
