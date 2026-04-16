@@ -106,7 +106,7 @@ hr { border: none; border-top: 1px solid rgba(0,0,0,0.08); margin: 10px 0; }
     unsafe_allow_html=True,
 )
 
-DEFAULT_LLM_MODEL = "gpt-4.1-long-context"
+DEFAULT_LLM_MODEL = "gpt-4.1"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
 DEFAULT_SENTIMENT_ARTIFACTS = "sentiment_assets/sentiment_openai.npz"
 
@@ -179,16 +179,19 @@ def normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
         p["homonym_noise"] = []
     if "search_noise_patterns" not in p or p["search_noise_patterns"] is None:
         p["search_noise_patterns"] = []
+
     def _normalize_named_categories(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out_items = []
         for item in items or []:
             if not isinstance(item, dict):
                 continue
-            name = (item.get("name") or item.get("category_name") or "").strip()
+            name = (item.get("name") or item.get(
+                "category_name") or "").strip()
             if not name:
                 continue
             description = (item.get("description") or "").strip()
-            patterns = [str(x).strip() for x in (item.get("patterns") or []) if str(x).strip()]
+            patterns = [str(x).strip() for x in (
+                item.get("patterns") or []) if str(x).strip()]
             out_items.append(
                 {
                     "name": name,
@@ -198,8 +201,10 @@ def normalize_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
             )
         return out_items
 
-    p["keep_categories"] = _normalize_named_categories(p.get("keep_categories", []))
-    p["drop_categories"] = _normalize_named_categories(p.get("drop_categories", []))
+    p["keep_categories"] = _normalize_named_categories(
+        p.get("keep_categories", []))
+    p["drop_categories"] = _normalize_named_categories(
+        p.get("drop_categories", []))
     return p
 
 
@@ -223,8 +228,10 @@ def format_system_prompt(base_template: str, profile: Dict[str, Any]) -> str:
     aliases = profile.get("aliases") or []
     aliases_str = ", ".join([a.strip()
                             for a in aliases if str(a).strip()]) or "—"
-    keep_categories_str = _format_named_categories(profile.get("keep_categories", []))
-    drop_categories_str = _format_named_categories(profile.get("drop_categories", []))
+    keep_categories_str = _format_named_categories(
+        profile.get("keep_categories", []))
+    drop_categories_str = _format_named_categories(
+        profile.get("drop_categories", []))
     return base_template.format(
         brand_name=brand_name,
         brand_description=desc if desc else "—",
@@ -432,6 +439,8 @@ def get_sentiment_model_cached(
     return m
 
 # ---------------- App (class-based) ----------------
+
+
 class StreamlitBrandAnalyticsApp:
     def __init__(self):
         self.brands = load_brands("brands.yaml")
@@ -475,7 +484,8 @@ class StreamlitBrandAnalyticsApp:
 
             batch_size = int(st.session_state.get("batch_size", 6))
             max_workers = int(st.session_state.get("max_workers", 3))
-            embed_model = st.session_state.get("embed_model", DEFAULT_EMBED_MODEL)
+            embed_model = st.session_state.get(
+                "embed_model", DEFAULT_EMBED_MODEL)
             embed_batch = int(st.session_state.get("embed_batch", 128))
             st.session_state["batch_size"] = batch_size
             st.session_state["max_workers"] = max_workers
@@ -540,14 +550,16 @@ class StreamlitBrandAnalyticsApp:
 
         keep_categories_raw = st.text_area(
             "Keep categories (one per line: Название - описание)",
-            value=format_named_categories_text(profile.get("keep_categories", [])),
+            value=format_named_categories_text(
+                profile.get("keep_categories", [])),
             height=160,
             placeholder="Покупка и ассортимент - Комментарии про товары, наличие, размеры, выбор\nПриложение и бонусы - Комментарии про приложение, сайт, оплату, бонусы",
         )
 
         drop_categories_raw = st.text_area(
             "Drop categories (one per line: Название - описание)",
-            value=format_named_categories_text(profile.get("drop_categories", [])),
+            value=format_named_categories_text(
+                profile.get("drop_categories", [])),
             height=160,
             placeholder="Вакансии и найм - Сообщения про вакансии, поиск сотрудников, HR\nЛокация и ориентир - Бренд упомянут только как гео-точка",
         )
@@ -596,16 +608,22 @@ class StreamlitBrandAnalyticsApp:
                         try:
                             df_ex = read_uploaded_table(ex_file)
                             if "Текст" not in df_ex.columns or "Категория" not in df_ex.columns:
-                                st.error("Файл примеров должен содержать колонки 'Текст' и 'Категория'.")
+                                st.error(
+                                    "Файл примеров должен содержать колонки 'Текст' и 'Категория'.")
                                 examples_invalid = True
                                 df_ex = None
                             if df_ex is not None:
-                                allowed = {item["name"] for item in updated_profile.get("drop_categories", [])}
+                                allowed = {item["name"] for item in updated_profile.get(
+                                    "drop_categories", [])}
                                 subset = df_ex[["Текст", "Категория"]].copy()
-                                subset["Текст"] = subset["Текст"].astype(str).fillna("").str.strip()
-                                subset["Категория"] = subset["Категория"].astype(str).fillna("").str.strip()
-                                subset = subset[(subset["Текст"] != "") & (subset["Категория"] != "")]
-                                unknown = sorted({x for x in subset["Категория"].tolist() if x not in allowed})
+                                subset["Текст"] = subset["Текст"].astype(
+                                    str).fillna("").str.strip()
+                                subset["Категория"] = subset["Категория"].astype(
+                                    str).fillna("").str.strip()
+                                subset = subset[(subset["Текст"] != "") & (
+                                    subset["Категория"] != "")]
+                                unknown = sorted(
+                                    {x for x in subset["Категория"].tolist() if x not in allowed})
                                 if unknown:
                                     st.error(
                                         "В файле примеров есть категории, которых нет в списке drop-категорий: "
@@ -633,7 +651,8 @@ class StreamlitBrandAnalyticsApp:
                                 updated_profile.get("drop_categories", []),
                                 examples,
                                 client=client,
-                                model=st.session_state.get("llm_model", DEFAULT_LLM_MODEL),
+                                model=st.session_state.get(
+                                    "llm_model", DEFAULT_LLM_MODEL),
                                 temperature=0.2,
                             )
                             patterns_by_name = {
@@ -649,7 +668,8 @@ class StreamlitBrandAnalyticsApp:
                             ]
 
                             # persist for session
-                            overrides = dict(st.session_state.get("brand_rule_overrides", {}))
+                            overrides = dict(st.session_state.get(
+                                "brand_rule_overrides", {}))
                             if chosen != "(manual)":
                                 overrides[chosen] = dict(updated_profile)
                                 st.session_state["brand_rule_overrides"] = overrides
@@ -1014,8 +1034,10 @@ class StreamlitBrandAnalyticsApp:
                         st.error(
                             "Labeled dataset must contain columns 'Текст' and 'Категория'.")
                         st.stop()
-                    ref_categories = df_ref["Категория"].astype(str).fillna("").str.strip()
-                    unknown_cats = sorted({x for x in ref_categories.tolist() if x and x not in allowed_categories})
+                    ref_categories = df_ref["Категория"].astype(
+                        str).fillna("").str.strip()
+                    unknown_cats = sorted(
+                        {x for x in ref_categories.tolist() if x and x not in allowed_categories})
                     if unknown_cats:
                         st.error(
                             "Labeled dataset contains categories outside Keep categories: "
