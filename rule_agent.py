@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
@@ -22,6 +24,16 @@ class GeneratedCategoryRules(BaseModel):
 
 class RuleGenResult(BaseModel):
     rules: List[GeneratedCategoryRules] = Field(default_factory=list)
+
+
+def _normalize_category_name(raw: str) -> str:
+    s = "" if raw is None else str(raw)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+    s = s.replace("Ё", "Е").replace("ё", "е")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.strip("\"'«»`*_•-—:;,. ")
+    return s.casefold()
 
 
 def _build_rules_prompt(
@@ -99,12 +111,14 @@ def generate_rules(
     allowed = [(item.get("name") or "").strip() for item in drop_categories]
     allowed = [name for name in allowed if name]
     out_map = {name: [] for name in allowed}
+    normalized_allowed = {_normalize_category_name(name): name for name in allowed}
 
     for rule_item in parsed.rules:
         name = (rule_item.category_name or "").strip()
-        if name not in out_map:
+        canonical_name = normalized_allowed.get(_normalize_category_name(name))
+        if canonical_name not in out_map:
             continue
-        out_map[name] = [p.strip() for p in (rule_item.patterns or []) if str(p).strip()]
+        out_map[canonical_name] = [p.strip() for p in (rule_item.patterns or []) if str(p).strip()]
 
     ordered_rules = [
         GeneratedCategoryRules(category_name=name, patterns=out_map.get(name, []))

@@ -6,6 +6,7 @@ import io
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -257,19 +258,66 @@ def format_named_categories_text(categories: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _clean_category_text(raw: Any) -> str:
+    s = "" if raw is None else str(raw)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _split_category_line(raw_line: str) -> Tuple[str, str]:
+    line = _clean_category_text(raw_line)
+    if not line:
+        return "", ""
+
+    parts = re.split(r"\s*(?:—|–|:)\s*|\s+-\s*|\s*-\s+", line, maxsplit=1)
+    name = _clean_category_text(parts[0] if parts else "")
+    description = _clean_category_text(parts[1] if len(parts) > 1 else "")
+    return name, description
+
+
+def normalize_category_name(raw: Any) -> str:
+    name, _ = _split_category_line(raw)
+    if not name:
+        name = _clean_category_text(raw)
+    name = name.replace("Ё", "Е").replace("ё", "е")
+    name = name.strip("\"'«»`*_•-—:;,. ")
+    name = re.sub(r"\s+", " ", name).strip()
+    return name.casefold()
+
+
+def match_allowed_category_name(raw: Any, allowed_names: List[str]) -> Optional[str]:
+    raw_clean = _clean_category_text(raw)
+    if not raw_clean:
+        return None
+
+    allowed_map = {normalize_category_name(name): name for name in allowed_names if _clean_category_text(name)}
+
+    direct = allowed_map.get(normalize_category_name(raw_clean))
+    if direct:
+        return direct
+
+    extracted_name, _ = _split_category_line(raw_clean)
+    if extracted_name:
+        extracted = allowed_map.get(normalize_category_name(extracted_name))
+        if extracted:
+            return extracted
+
+    return None
+
+
 def parse_named_categories_text(raw_text: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen = set()
     for raw_line in (raw_text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
+        name, description = _split_category_line(raw_line)
+        if not name:
             continue
-        parts = re.split(r"\s+[—-]\s+|:\s*", line, maxsplit=1)
-        name = (parts[0] or "").strip()
-        description = (parts[1] if len(parts) > 1 else "").strip()
-        if not name or name.lower() in seen:
+        key = normalize_category_name(name)
+        if not key or key in seen:
             continue
-        seen.add(name.lower())
+        seen.add(key)
         out.append({"name": name, "description": description, "patterns": []})
     return out
 
@@ -616,14 +664,18 @@ class StreamlitBrandAnalyticsApp:
                                 allowed = {item["name"] for item in updated_profile.get(
                                     "drop_categories", [])}
                                 subset = df_ex[["Текст", "Категория"]].copy()
-                                subset["Текст"] = subset["Текст"].astype(
-                                    str).fillna("").str.strip()
-                                subset["Категория"] = subset["Категория"].astype(
-                                    str).fillna("").str.strip()
+                                subset["Текст"] = subset["Текст"].fillna(
+                                    "").astype(str).map(_clean_category_text)
+                                subset["Категория"] = subset["Категория"].fillna(
+                                    "").astype(str).map(_clean_category_text)
                                 subset = subset[(subset["Текст"] != "") & (
                                     subset["Категория"] != "")]
+                                subset["Категория_matched"] = subset["Категория"].map(
+                                    lambda x: match_allowed_category_name(x, list(allowed))
+                                )
                                 unknown = sorted(
-                                    {x for x in subset["Категория"].tolist() if x not in allowed})
+                                    {x for x in subset.loc[subset["Категория_matched"].isna(), "Категория"].tolist()}
+                                )
                                 if unknown:
                                     st.error(
                                         "В файле примеров есть категории, которых нет в списке drop-категорий: "
@@ -635,7 +687,7 @@ class StreamlitBrandAnalyticsApp:
                                     examples.append(
                                         {
                                             "text": str(row["Текст"])[:400],
-                                            "category": str(row["Категория"]),
+                                            "category": str(row["Категория_matched"] or row["Категория"]),
                                         }
                                     )
                         except Exception as e:
@@ -1087,10 +1139,14 @@ class StreamlitBrandAnalyticsApp:
                         st.error(
                             "Labeled dataset must contain columns 'Текст' and 'Категория'.")
                         st.stop()
-                    ref_categories = df_ref["Категория"].astype(
-                        str).fillna("").str.strip()
+                    ref_categories = df_ref["Категория"].fillna(
+                        "").astype(str).map(_clean_category_text)
+                    ref_categories_matched = ref_categories.map(
+                        lambda x: match_allowed_category_name(x, allowed_categories)
+                    )
                     unknown_cats = sorted(
-                        {x for x in ref_categories.tolist() if x and x not in allowed_categories})
+                        {x for x in ref_categories[ref_categories_matched.isna()].tolist() if x}
+                    )
                     if unknown_cats:
                         st.error(
                             "Labeled dataset contains categories outside Keep categories: "
@@ -1100,7 +1156,7 @@ class StreamlitBrandAnalyticsApp:
 
                     ref_texts = [preprocess_fn(x) for x in df_ref["Текст"].astype(
                         str).fillna("").tolist()]
-                    ref_cats = ref_categories.tolist()
+                    ref_cats = ref_categories_matched.fillna("").tolist()
 
                     with st.spinner("Building embedding index for labeled dataset…"):
                         ref_index = tagger.build_index(
