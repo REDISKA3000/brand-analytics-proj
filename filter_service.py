@@ -188,17 +188,6 @@ class RelevanceFilterService:
 
         batches = chunk_list(to_llm_pairs, batch_size)
 
-        # warmup (опционально, не критично)
-        try:
-            self.llm.classify_batch(
-                batch=batches[0],
-                system_prompt=system_prompt,
-                model=model,
-                temperature=temperature,
-            )
-        except Exception:
-            pass
-
         llm_rows = []
         latencies = []
 
