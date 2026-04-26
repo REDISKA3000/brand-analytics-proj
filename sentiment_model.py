@@ -229,8 +229,14 @@ class SentimentModel:
 
         raise RuntimeError("Max retries exceeded (LLM batch)")
 
-    def llm_fallback_parallel(self, idx_and_text: List[Tuple[int, str]]) -> Dict[int, str]:
+    def llm_fallback_parallel(
+        self,
+        idx_and_text: List[Tuple[int, str]],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[int, str]:
         if not idx_and_text:
+            if progress_callback is not None:
+                progress_callback(0, 0)
             return {}
 
         bs = max(1, int(self.cfg.llm_batch_size))
@@ -238,10 +244,15 @@ class SentimentModel:
                    for i in range(0, len(idx_and_text), bs)]
 
         out: Dict[int, str] = {}
+        completed = 0
         with ThreadPoolExecutor(max_workers=max(1, int(self.cfg.llm_workers))) as ex:
             futs = [ex.submit(self._llm_classify_batch, b) for b in batches]
             for f in as_completed(futs):
-                out.update(f.result())
+                batch_map = f.result()
+                out.update(batch_map)
+                completed += len(batch_map)
+                if progress_callback is not None:
+                    progress_callback(completed, len(idx_and_text))
         return out
 
     # ----------------------------
@@ -252,8 +263,32 @@ class SentimentModel:
         texts: Sequence[str],
         embed_batch_size: int = 128,
         return_df: bool = True,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ):
         texts = ["" if t is None else str(t).strip() for t in texts]
+        total_count = len(texts)
+        if total_count == 0:
+            if progress_callback is not None:
+                progress_callback(0, 0, "sentiment")
+            if not return_df:
+                labels = np.array([], dtype=object)
+                source = np.array([], dtype=object)
+                sim_pred = np.array([], dtype=np.float32)
+                scores = np.empty((0, 3), dtype=np.float32)
+                return labels, source, sim_pred, scores
+
+            return pd.DataFrame(
+                {
+                    "text": [],
+                    "pred_label": [],
+                    "pred_source": [],
+                    "sim_pred": [],
+                    "s_negative": [],
+                    "s_neutral": [],
+                    "s_positive": [],
+                }
+            )
+
         # truncate for safety
         if self.cfg.truncate_chars:
             texts = [t[: self.cfg.truncate_chars] for t in texts]
@@ -264,19 +299,35 @@ class SentimentModel:
 
         labels = np.array([self.ID2LABEL_3[i] for i in pred3], dtype=object)
         source = np.where(pass_mask, "prototype", "llm")
+        base_completed = total_count if not self.cfg.enable_llm_fallback else int(pass_mask.sum())
+
+        if progress_callback is not None:
+            progress_callback(base_completed, total_count, "sentiment")
 
         # LLM fallback
         if self.cfg.enable_llm_fallback:
             need = np.where(~pass_mask)[0].tolist()
             if need:
                 payload = [(i, texts[i]) for i in need]
-                llm_map = self.llm_fallback_parallel(payload)
+                llm_map = self.llm_fallback_parallel(
+                    payload,
+                    progress_callback=(
+                        lambda done, total_need: progress_callback(
+                            min(total_count, base_completed + done),
+                            total_count,
+                            "sentiment",
+                        )
+                    ) if progress_callback is not None else None,
+                )
                 for i in need:
                     # LLM may return partial results; keep prototype label if missing
                     if i in llm_map:
                         labels[i] = llm_map[i]
                     else:
                         source[i] = "llm_fail"
+
+        if progress_callback is not None:
+            progress_callback(total_count, total_count, "sentiment")
 
         if not return_df:
             return labels, source, sim_pred, scores

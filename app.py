@@ -813,6 +813,19 @@ class StreamlitBrandAnalyticsApp:
         client = get_client(self.api_key or "")
         llm = OpenAIRelevanceBatchModel(client=client, default_model=model)
         service = RelevanceFilterService(llm=llm)
+        progress_bar = st.progress(0.0, text="Preparing Relevance…")
+
+        def _set_pipeline_progress(progress_value: float, text: str) -> None:
+            progress_bar.progress(max(0.0, min(1.0, float(progress_value))), text=text)
+
+        def _on_relevance_progress(done: int, total: int, stage: str) -> None:
+            total_safe = max(1, int(total))
+            progress = 0.5 if enable_sentiment else 1.0
+            current = progress * (int(done) / total_safe)
+            _set_pipeline_progress(
+                current,
+                f"Relevance: {int(done)}/{int(total)} messages",
+            )
 
         # ---- relevance ----
         with st.spinner("Relevance (RULE + LLM batches)…"):
@@ -826,7 +839,11 @@ class StreamlitBrandAnalyticsApp:
                 truncate_chars=truncate_chars,
                 model=model,
                 temperature=temperature,
+                progress_callback=_on_relevance_progress,
             )
+
+        if not enable_sentiment:
+            _set_pipeline_progress(1.0, f"Relevance complete: {len(texts)}/{len(texts)} messages")
 
         df_out = df_in.copy()
         df_out["is_drop"] = ["Yes" if a == "drop" else "No" for a in actions]
@@ -843,13 +860,32 @@ class StreamlitBrandAnalyticsApp:
             if sent_service is None:
                 st.warning(
                     "Sentiment: assets not found — sentiment will be skipped.")
+                _set_pipeline_progress(1.0, "Sentiment skipped: assets not found")
             else:
                 with st.spinner("Sentiment inference…"):
+                    sentiment_total = 0
+
+                    def _on_sentiment_progress(done: int, total: int, stage: str) -> None:
+                        total_safe = max(1, int(total))
+                        current = 0.5 + 0.5 * (int(done) / total_safe)
+                        _set_pipeline_progress(
+                            current,
+                            f"Sentiment: {int(done)}/{int(total)} messages",
+                        )
+
                     if sentiment_only_kept:
                         kept_mask = df_out["is_drop"].astype(
                             str).str.lower().eq("no").tolist()
                         kept_texts = [t for t, k in zip(texts, kept_mask) if k]
-                        labels, sources = sent_service.predict_many(kept_texts)
+                        sentiment_total = len(kept_texts)
+                        if sentiment_total == 0:
+                            _set_pipeline_progress(1.0, "Sentiment: 0/0 messages")
+                            labels, sources = [], []
+                        else:
+                            labels, sources = sent_service.predict_many(
+                                kept_texts,
+                                progress_callback=_on_sentiment_progress,
+                            )
 
                         sent_col = []
                         src_col = []
@@ -865,9 +901,18 @@ class StreamlitBrandAnalyticsApp:
                         df_out["sentiment"] = sent_col
                         df_out["sentiment_source"] = src_col
                     else:
-                        labels, sources = sent_service.predict_many(texts)
+                        sentiment_total = len(texts)
+                        labels, sources = sent_service.predict_many(
+                            texts,
+                            progress_callback=_on_sentiment_progress,
+                        )
                         df_out["sentiment"] = labels
                         df_out["sentiment_source"] = sources
+
+                _set_pipeline_progress(
+                    1.0,
+                    f"Sentiment complete: {sentiment_total}/{sentiment_total} messages",
+                )
 
         # save for categories step
         st.session_state["last_filtered_df"] = df_out.copy()
@@ -1015,6 +1060,14 @@ class StreamlitBrandAnalyticsApp:
             temperature=0.0,
         )
         svc = CategoryTaggingService(tagger=tagger)
+        progress_bar = st.progress(0.0, text="Preparing Category tagging…")
+
+        def _on_category_progress(done: int, total: int, stage: str) -> None:
+            total_safe = max(1, int(total))
+            progress_bar.progress(
+                max(0.0, min(1.0, int(done) / total_safe)),
+                text=f"Category tagging: {int(done)}/{int(total)} messages",
+            )
 
         # build/cache ref index (optional)
         ref_index: Optional[CategoryIndex] = None
@@ -1079,7 +1132,10 @@ class StreamlitBrandAnalyticsApp:
                 max_workers=int(max_workers),
                 truncate_chars=int(truncate_chars),
                 embed_batch_size=int(embed_batch),
+                progress_callback=_on_category_progress,
             )
+
+        progress_bar.progress(1.0, text=f"Category tagging complete: {len(df_in)}/{len(df_in)} messages")
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.header("Result (Categories)")

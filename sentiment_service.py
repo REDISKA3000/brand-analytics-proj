@@ -35,10 +35,18 @@ class SentimentService:
             },
         }
 
-    def predict_many(self, texts: Sequence[str]) -> Tuple[List[str], List[str]]:
+    def predict_many(
+        self,
+        texts: Sequence[str],
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Tuple[List[str], List[str]]:
         clean = [self.preprocess_fn(t) for t in texts]
         df = self.model.predict_texts(
-            list(clean), embed_batch_size=self.embed_batch_size, return_df=True)
+            list(clean),
+            embed_batch_size=self.embed_batch_size,
+            return_df=True,
+            progress_callback=progress_callback,
+        )
         labels = df["pred_label"].astype(str).tolist()
         sources = df["pred_source"].astype(str).tolist()
         return labels, sources

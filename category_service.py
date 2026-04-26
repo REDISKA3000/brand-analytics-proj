@@ -1,7 +1,7 @@
 # category_service.py
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import pandas as pd
 
@@ -31,6 +31,7 @@ class CategoryTaggingService:
         max_workers: int = 3,
         truncate_chars: int = 800,
         embed_batch_size: int = 128,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         if text_col not in df_in.columns:
             raise ValueError(f"Не найден столбец '{text_col}'")
@@ -87,6 +88,12 @@ class CategoryTaggingService:
         preds = [None] * len(clean_texts)
         sources = ["skip_drop" if skip[i] else "skip_empty" if not clean_texts[i].strip(
         ) else "" for i in range(len(clean_texts))]
+        completed_count = sum(
+            1 for i in range(len(clean_texts)) if skip[i] or not clean_texts[i].strip()
+        )
+
+        if progress_callback is not None:
+            progress_callback(completed_count, len(clean_texts), "category_tagging")
 
         t0 = time.perf_counter()
 
@@ -105,14 +112,19 @@ class CategoryTaggingService:
             return out_map
 
         with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
-            futs = [ex.submit(one_job, ch) for ch in chunks]
-            for f in as_completed(futs):
+            fut_to_size = {ex.submit(one_job, ch): len(ch) for ch in chunks}
+            for f in as_completed(fut_to_size):
                 out_map = f.result()
                 for gi, cat in out_map.items():
                     preds[gi] = cat
                     sources[gi] = "rag_llm" if use_rag else "llm"
+                completed_count += fut_to_size[f]
+                if progress_callback is not None:
+                    progress_callback(completed_count, len(clean_texts), "category_tagging")
 
         total_s = time.perf_counter() - t0
+        if progress_callback is not None:
+            progress_callback(len(clean_texts), len(clean_texts), "category_tagging")
 
         df_out = df_in.copy()
         df_out["Категория_pred"] = preds

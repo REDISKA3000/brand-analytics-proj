@@ -1,7 +1,7 @@
 # filter_service.py
 import time
 import re
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from llm_model import OpenAIRelevanceBatchModel
@@ -152,6 +152,7 @@ class RelevanceFilterService:
         truncate_chars: int = 800,
         model: Optional[str] = None,
         temperature: float = 0.0,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> tuple[List[str], Dict[str, Any]]:
         """
         Возвращает:
@@ -175,8 +176,13 @@ class RelevanceFilterService:
             else:
                 to_llm_pairs.append((i, preprocess_fn(t_rule)))
 
+        if progress_callback is not None:
+            progress_callback(rule_drop_count, len(text_rule_list), "relevance")
+
         if not to_llm_pairs:
             total_s = time.perf_counter() - t0_total
+            if progress_callback is not None:
+                progress_callback(len(text_rule_list), len(text_rule_list), "relevance")
             return actions, {
                 "total_s": total_s,
                 "n": len(text_rule_list),
@@ -190,6 +196,7 @@ class RelevanceFilterService:
 
         llm_rows = []
         latencies = []
+        completed_count = rule_drop_count
 
         def one_job(batch):
             return self.llm.classify_batch(
@@ -205,6 +212,9 @@ class RelevanceFilterService:
                 rows, dt = f.result()
                 llm_rows.extend(rows)
                 latencies.append(dt)
+                completed_count += len(rows)
+                if progress_callback is not None:
+                    progress_callback(completed_count, len(text_rule_list), "relevance")
 
         for r in llm_rows:
             idx = int(r["global_idx"])
@@ -216,6 +226,8 @@ class RelevanceFilterService:
                 actions[i] = "keep"
 
         total_s = time.perf_counter() - t0_total
+        if progress_callback is not None:
+            progress_callback(len(text_rule_list), len(text_rule_list), "relevance")
         return actions, {
             "total_s": total_s,
             "n": len(text_rule_list),
