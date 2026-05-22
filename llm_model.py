@@ -79,9 +79,15 @@ class OpenAIRelevanceBatchModel:
     _LIMITERS: Dict[str, _RollingTokenLimiter] = {}
     _LIMITERS_LOCK = threading.Lock()
 
-    def __init__(self, client: OpenAI, default_model: str = "gpt-4.1-mini"):
+    def __init__(self, client: OpenAI, default_model: str = "gpt-5.4-mini"):
         self.client = client
         self.default_model = default_model
+
+    @staticmethod
+    def _reasoning_options(model_name: str) -> Optional[Dict[str, str]]:
+        if str(model_name or "").startswith("gpt-5.4-mini"):
+            return {"effort": "none"}
+        return None
 
     @classmethod
     def _get_limiter(cls, model_name: str) -> Optional[_RollingTokenLimiter]:
@@ -129,6 +135,7 @@ class OpenAIRelevanceBatchModel:
         prompt = self.build_prompt(batch)
         use_model = model or self.default_model
         limiter = self._get_limiter(use_model)
+        reasoning = self._reasoning_options(use_model)
 
         for attempt in range(max_retries):
             try:
@@ -144,6 +151,7 @@ class OpenAIRelevanceBatchModel:
                     ],
                     text_format=BatchResult,
                     temperature=temperature,
+                    reasoning=reasoning,
                 )
                 dt = time.perf_counter() - t0
 

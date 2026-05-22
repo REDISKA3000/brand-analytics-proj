@@ -28,6 +28,12 @@ def _l2_normalize(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return X / (n + eps)
 
 
+def _reasoning_options(model_name: str) -> Optional[Dict[str, str]]:
+    if str(model_name or "").startswith("gpt-5.4-mini"):
+        return {"effort": "none"}
+    return None
+
+
 class _LLMItem(BaseModel):
     global_idx: int
     label: Literal["negative", "neutral", "positive"]
@@ -47,7 +53,7 @@ class SentimentModelConfig:
 
     # fallback to LLM
     enable_llm_fallback: bool = True
-    llm_model: str = "gpt-4.1-mini"
+    llm_model: str = "gpt-5.4-mini"
     llm_batch_size: int = 20
     llm_workers: int = 3
     truncate_chars: int = 800
@@ -219,6 +225,7 @@ class SentimentModel:
                     ],
                     temperature=0,
                     text_format=_LLMBatch,
+                    reasoning=_reasoning_options(self.cfg.llm_model),
                 )
                 parsed: _LLMBatch = resp.output_parsed
                 return {item.global_idx: item.label for item in parsed.results}

@@ -36,6 +36,12 @@ def _normalize_category_name(raw: str) -> str:
     return s.casefold()
 
 
+def _reasoning_options(model_name: str):
+    if str(model_name or "").startswith("gpt-5.4-mini"):
+        return {"effort": "none"}
+    return None
+
+
 def _build_rules_prompt(
     profile: Dict[str, Any],
     drop_categories: List[Dict[str, Any]],
@@ -105,6 +111,7 @@ def generate_rules(
         input=[{"role": "user", "content": prompt}],
         text_format=RuleGenResult,
         temperature=temperature,
+        reasoning=_reasoning_options(model),
     )
 
     parsed: RuleGenResult = resp.output_parsed

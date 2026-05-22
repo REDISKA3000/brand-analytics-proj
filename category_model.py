@@ -64,6 +64,12 @@ def _best_match_to_allowed(raw: str, allowed: Sequence[str]) -> Optional[str]:
     return best_cat if best_score >= 0.60 else None
 
 
+def _reasoning_options(model_name: str) -> Optional[Dict[str, str]]:
+    if str(model_name or "").startswith("gpt-5.4-mini"):
+        return {"effort": "none"}
+    return None
+
+
 @dataclass
 class CategoryIndex:
     ref_texts: List[str]
@@ -85,7 +91,7 @@ class CategoryTagger:
         *,
         client,
         embedder,
-        llm_model: str = "gpt-4.1-mini",
+        llm_model: str = "gpt-5.4-mini",
         max_output_tokens: int = 1200,
         temperature: float = 0.0,
     ):
@@ -261,6 +267,7 @@ ITEM'ы:
             ],
             max_output_tokens=self.max_output_tokens,
             temperature=self.temperature,
+            reasoning=_reasoning_options(self.llm_model),
         )
 
         raw = resp.output[0].content[0].text if resp and resp.output else ""
